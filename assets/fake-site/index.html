@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nexus Systems — Coming Soon</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    color-scheme: light;
+    --page: #f6f8fc;
+    --surface: #ffffff;
+    --line: #dfe6f1;
+    --text: #182033;
+    --muted: #69758a;
+    --accent: #3867d6;
+    --accent-soft: #eef3ff;
+  }
+  body {
+    background: var(--page);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 32px 20px;
+  }
+  .logo-mark {
+    width: 58px; height: 58px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 28px;
+    box-shadow: 0 12px 32px rgba(42, 58, 91, 0.08);
+    font-size: 1.15rem; font-weight: 750; color: var(--accent);
+    letter-spacing: -0.04em;
+  }
+  h1 {
+    font-size: clamp(2.25rem, 7vw, 4.5rem);
+    font-weight: 720;
+    letter-spacing: -0.055em;
+    line-height: 1.05;
+    color: var(--text);
+    margin-bottom: 18px;
+  }
+  .tagline {
+    font-size: 0.76rem;
+    font-weight: 700;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid #dce6ff;
+    border-radius: 999px;
+    margin-bottom: 18px;
+    padding: 7px 12px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+  }
+  .countdown {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(76px, 110px));
+    gap: 10px;
+    margin-bottom: 30px;
+  }
+  .unit {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 18px 10px 15px;
+    box-shadow: 0 8px 24px rgba(42, 58, 91, 0.05);
+  }
+  .unit .number {
+    display: block;
+    font-size: clamp(1.8rem, 5vw, 2.5rem);
+    font-weight: 680;
+    color: var(--text);
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .unit .label {
+    display: block;
+    font-size: 0.64rem;
+    font-weight: 650;
+    text-transform: uppercase;
+    letter-spacing: 0.11em;
+    color: var(--muted);
+    margin-top: 7px;
+  }
+  .divider {
+    width: 42px; height: 2px;
+    background: var(--accent);
+    border-radius: 999px;
+    margin: 0 auto 28px;
+  }
+  .company {
+    font-size: 0.7rem;
+    color: var(--muted);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  .company span { color: var(--text); font-weight: 700; }
+  @media (max-width: 440px) {
+    .countdown { grid-template-columns: repeat(2, minmax(105px, 1fr)); }
+    body { padding: 24px 16px; }
+  }
+</style>
+</head>
+<body>
+  <div class="logo-mark">NX</div>
+  <p class="tagline">Something big is on its way</p>
+  <h1>Coming Soon</h1>
+  <div class="divider"></div>
+  <div class="countdown">
+    <div class="unit"><span class="number" id="days">00</span><span class="label">Days</span></div>
+    <div class="unit"><span class="number" id="hours">00</span><span class="label">Hours</span></div>
+    <div class="unit"><span class="number" id="mins">00</span><span class="label">Minutes</span></div>
+    <div class="unit"><span class="number" id="secs">00</span><span class="label">Seconds</span></div>
+  </div>
+  <p class="company"><span>Nexus Systems</span> &mdash; Redefining Infrastructure</p>
+  <script>
+    var target = new Date();
+    target.setDate(target.getDate() + 47);
+    function tick() {
+      var diff = target - new Date();
+      if (diff < 0) return;
+      document.getElementById('days').textContent = String(Math.floor(diff / 86400000)).padStart(2,'0');
+      document.getElementById('hours').textContent = String(Math.floor(diff % 86400000 / 3600000)).padStart(2,'0');
+      document.getElementById('mins').textContent = String(Math.floor(diff % 3600000 / 60000)).padStart(2,'0');
+      document.getElementById('secs').textContent = String(Math.floor(diff % 60000 / 1000)).padStart(2,'0');
+    }
+    tick(); setInterval(tick, 1000);
+  </script>
+</body>
+</html>

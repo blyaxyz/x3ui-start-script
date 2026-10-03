@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network Diagnostics</title>
+<meta name="robots" content="noindex, nofollow">
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f5f7fb;
+    --surface: #ffffff;
+    --surface-soft: #f8faff;
+    --border: #dde4ef;
+    --accent: #3568d4;
+    --accent2: #078563;
+    --warn: #a65a08;
+    --error: #c93b42;
+    --text: #1b2436;
+    --text-dim: #68758a;
+    --radius: 14px;
+    --mono: 'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+    padding: 42px 18px 60px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 {
+    color: var(--text);
+    font-size: clamp(1.75rem, 4vw, 2.35rem);
+    font-weight: 720;
+    letter-spacing: -0.035em;
+    margin-bottom: 7px;
+  }
+  .subtitle { color: var(--text-dim); font-size: 0.9rem; margin-bottom: 28px; }
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 10px 30px rgba(31, 49, 80, 0.05);
+    padding: 26px;
+    margin-bottom: 18px;
+  }
+  .section-title {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+  }
+  .section-title::before {
+    content: '';
+    display: block;
+    width: 3px; height: 18px;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  /* Speed test */
+  .speed-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+  .speed-card {
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 22px 14px;
+    text-align: center;
+  }
+  .speed-card-label { font-size: 0.85rem; color: var(--text-dim); margin-bottom: 10px; }
+  .speed-card-value { font-size: 2.6rem; font-weight: 680; color: var(--text); line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -0.04em; }
+  .speed-card-unit  { font-size: 0.8rem;  color: var(--text-dim); margin-top: 4px; }
+  .speed-card-note  { font-size: 0.75rem; color: var(--text-dim); margin-top: 8px; min-height: 1em; }
+
+  /* MTR form */
+  .mtr-form { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group label { font-size: 0.82rem; color: var(--text-dim); }
+  .form-group input[type="number"] {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    color: var(--text);
+    padding: 8px 12px;
+    font-size: 0.95rem;
+    width: 120px;
+  }
+  .form-group input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(53,104,212,0.11); }
+  .btn {
+    background: var(--accent);
+    border: none;
+    border-radius: 9px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 0.95rem;
+    font-weight: 600;
+    padding: 10px 20px;
+    box-shadow: 0 5px 14px rgba(53,104,212,0.18);
+    transition: background 0.15s, transform 0.15s;
+  }
+  .btn:hover { background: #2859c1; transform: translateY(-1px); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #mtr-result {
+    margin-top: 16px;
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.5;
+    padding: 14px 16px;
+    white-space: pre;
+    overflow-x: auto;
+    min-height: 48px;
+    color: var(--text);
+    display: none;
+  }
+  .status-tag {
+    display: inline-block;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 3px 9px;
+  }
+  .tag-info  { background: #eaf0ff; color: var(--accent); }
+  .tag-ok    { background: #e4f6ef; color: var(--accent2); }
+  .tag-warn  { background: #fff1de; color: var(--warn); }
+  .tag-error { background: #fdebed; color: var(--error); }
+  #mtr-status { margin-top: 10px; font-size: 0.85rem; }
+  #client-ip { font-family: var(--mono); font-weight: 600; color: var(--accent2); }
+
+  /* Download test files */
+  .file-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+  .file-card {
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-decoration: none;
+    color: var(--text);
+    transition: border-color 0.15s, background 0.15s, transform 0.15s;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .file-card:hover { border-color: #adc2ed; background: #f3f7ff; transform: translateY(-1px); }
+  .file-size { font-size: 1.3rem; font-weight: 700; color: var(--text); }
+  .file-name { font-size: 0.8rem; color: var(--text-dim); font-family: var(--mono); }
+
+  /* WinMTR instructions */
+  .instruction-steps { list-style: none; counter-reset: steps; }
+  .instruction-steps li {
+    counter-increment: steps;
+    padding: 8px 0 8px 40px;
+    position: relative;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+  .instruction-steps li:last-child { border-bottom: none; }
+  .instruction-steps li::before {
+    content: counter(steps);
+    position: absolute;
+    left: 0;
+    background: var(--accent);
+    border-radius: 50%;
+    width: 24px; height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #fff;
+    top: 8px;
+  }
+  .code-inline {
+    background: var(--surface-soft);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    padding: 2px 6px;
+  }
+  #server-ip { font-family: var(--mono); color: var(--accent); }
+  a.link { color: var(--accent); text-decoration: none; }
+  a.link:hover { text-decoration: underline; }
+  .spinner { display: none; }
+  .spinner.active {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-left: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (max-width: 640px) {
+    body { padding: 24px 12px 40px; }
+    .section { padding: 20px 16px; }
+    .speed-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .speed-card-value { font-size: 2.15rem; }
+    .file-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Network Diagnostics</h1>
+  <p class="subtitle">Server diagnostics panel — <span class="status-tag tag-info">Private</span></p>
+
+  <!-- ── Speed Test ──────────────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-title">Speed Test</div>
+    <p style="font-size:0.85rem;color:var(--text-dim);margin-bottom:20px;">
+      Runs directly between your browser and this server — no external connections.
+      Powered by <a class="link" href="https://github.com/librespeed/speedtest" target="_blank" rel="noopener noreferrer">LibreSpeed</a>:
+      parallel streams, 15 s per direction.
+    </p>
+    <div class="speed-grid">
+      <div class="speed-card">
+        <div class="speed-card-label">↓ Download</div>
+        <div class="speed-card-value" id="dl-speed">—</div>
+        <div class="speed-card-unit">Mbps</div>
+        <div class="speed-card-note" id="dl-note"></div>
+      </div>
+      <div class="speed-card">
+        <div class="speed-card-label">↑ Upload</div>
+        <div class="speed-card-value" id="ul-speed">—</div>
+        <div class="speed-card-unit">Mbps</div>
+        <div class="speed-card-note" id="ul-note"></div>
+      </div>
+      <div class="speed-card">
+        <div class="speed-card-label">Ping</div>
+        <div class="speed-card-value" id="ping-val">—</div>
+        <div class="speed-card-unit">ms</div>
+        <div class="speed-card-note"></div>
+      </div>
+      <div class="speed-card">
+        <div class="speed-card-label">Jitter</div>
+        <div class="speed-card-value" id="jitter-val">—</div>
+        <div class="speed-card-unit">ms</div>
+        <div class="speed-card-note"></div>
+      </div>
+    </div>
+    <button class="btn" id="speed-btn" onclick="toggleSpeedTest()">Start Speed Test</button>
+    <div id="speed-status" style="margin-top:14px;font-size:0.85rem;min-height:1.4em;"></div>
+  </div>
+
+  <!-- ── MTR Test ───────────────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-title">MTR Network Path Test</div>
+    <p style="font-size:0.85rem;color:var(--text-dim);margin-bottom:16px;">
+      Runs <code class="code-inline">mtr</code> from this server to your IP address
+      (<span id="client-ip">detecting…</span>). Shows hop-by-hop latency and packet loss.
+    </p>
+    <div class="mtr-form">
+      <div class="form-group">
+        <label for="pkt-count">Packet count (1–100)</label>
+        <input type="number" id="pkt-count" value="5" min="1" max="100">
+      </div>
+      <button class="btn" id="mtr-btn" onclick="runMtr()">Run MTR</button>
+      <span class="spinner" id="mtr-spinner"></span>
+    </div>
+    <div id="mtr-status"></div>
+    <pre id="mtr-result"></pre>
+  </div>
+
+  <!-- ── Download Test Files ────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-title">Download Test Files</div>
+    <p style="font-size:0.85rem;color:var(--text-dim);margin-bottom:16px;">
+      Static binary files for bandwidth testing. Generated from <code class="code-inline">/dev/zero</code>.
+    </p>
+    <div class="file-grid">
+      <a class="file-card" href="__DIAG_PATH__testfiles/test-15k.bin" download>
+        <span class="file-size">15 KB</span>
+        <span class="file-name">test-15k.bin</span>
+      </a>
+      <a class="file-card" href="__DIAG_PATH__testfiles/test-17k.bin" download>
+        <span class="file-size">17 KB</span>
+        <span class="file-name">test-17k.bin</span>
+      </a>
+      <a class="file-card" href="__DIAG_PATH__testfiles/test-100m.bin" download>
+        <span class="file-size">100 MB</span>
+        <span class="file-name">test-100m.bin</span>
+      </a>
+      <a class="file-card" href="__DIAG_PATH__testfiles/test-1g.bin" download>
+        <span class="file-size">1 GB</span>
+        <span class="file-name">test-1g.bin</span>
+      </a>
+    </div>
+  </div>
+
+  <!-- ── WinMTR Instructions ────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-title">Run MTR from Windows (WinMTR)</div>
+    <p style="font-size:0.85rem;color:var(--text-dim);margin-bottom:16px;">
+      Test the network path from <em>your PC</em> to this server at
+      <code class="code-inline" id="server-display">__SERVER_DOMAIN__</code>
+      (IP: <span id="server-ip">__SERVER_IP__</span>).
+    </p>
+    <ol class="instruction-steps">
+      <li>
+        Download WinMTR from the official site:
+        <a class="link" href="https://github.com/White-Tiger/WinMTR/releases" target="_blank" rel="noopener noreferrer">
+          github.com/White-Tiger/WinMTR</a>
+        — extract the ZIP and run <code class="code-inline">WinMTR.exe</code>.
+      </li>
+      <li>
+        In the <strong>Host</strong> field, enter either the server IP
+        (<code class="code-inline" id="server-ip-step">__SERVER_IP__</code>)
+        or the domain
+        (<code class="code-inline">__SERVER_DOMAIN__</code>).
+      </li>
+      <li>
+        Set <strong>Max hosts</strong> to <code class="code-inline">30</code> and
+        <strong>Interval</strong> to <code class="code-inline">1000 ms</code>.
+      </li>
+      <li>
+        Click <strong>Start</strong> and let it run for at least <strong>300 packets</strong> (about 5 minutes).
+      </li>
+      <li>
+        Click <strong>Export TEXT</strong> to save the results, then share them with your support team.
+      </li>
+    </ol>
+  </div>
+</div>
+
+<script src="speedtest.js"></script>
+<script>
+// Detect client IP from server response header or API
+(async function detectIP() {
+  try {
+    const r = await fetch('__DIAG_PATH__api/mtr', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'count=1&detect_only=1'
+    });
+    const d = await r.json();
+    if (d.target) {
+      document.getElementById('client-ip').textContent = d.target;
+    }
+  } catch { /* non-critical */ }
+})();
+
+async function runMtr() {
+  const btn = document.getElementById('mtr-btn');
+  const spinner = document.getElementById('mtr-spinner');
+  const resultEl = document.getElementById('mtr-result');
+  const statusEl = document.getElementById('mtr-status');
+
+  // Validate input
+  const countInput = document.getElementById('pkt-count');
+  const count = parseInt(countInput.value, 10);
+  if (isNaN(count) || count < 1 || count > 100) {
+    statusEl.innerHTML = '<span class="status-tag tag-error">Packet count must be 1–100</span>';
+    return;
+  }
+
+  btn.disabled = true;
+  spinner.classList.add('active');
+  resultEl.style.display = 'none';
+  statusEl.innerHTML = '<span class="status-tag tag-info">Running MTR… this may take up to ' +
+    (count * 3) + ' seconds</span>';
+
+  try {
+    const resp = await fetch('__DIAG_PATH__api/mtr', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({count})
+    });
+
+    const data = await resp.json();
+    spinner.classList.remove('active');
+    btn.disabled = false;
+
+    if (resp.status === 429) {
+      statusEl.innerHTML = '<span class="status-tag tag-warn">Rate limit reached — please wait 60 seconds</span>';
+      return;
+    }
+
+    if (data.success) {
+      document.getElementById('client-ip').textContent = data.target || '';
+      statusEl.innerHTML = '<span class="status-tag tag-ok">MTR complete — ' +
+        count + ' packets to ' + (data.target || 'your IP') + '</span>';
+      resultEl.textContent = data.output || '(no output)';
+    } else {
+      statusEl.innerHTML = '<span class="status-tag tag-error">Error: ' +
+        escHtml(data.error || 'unknown') + '</span>';
+      resultEl.textContent = data.output || '';
+    }
+    resultEl.style.display = 'block';
+  } catch (err) {
+    spinner.classList.remove('active');
+    btn.disabled = false;
+    statusEl.innerHTML = '<span class="status-tag tag-error">Request failed: ' + escHtml(String(err)) + '</span>';
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Speed Test (LibreSpeed engine) ──────────────────────────────────────────
+// Upload accuracy over HTTP/2 requires parallel streams + XHR progress events;
+// a single big POST is throttled by the per-stream h2 flow-control window.
+let st = null;
+
+function speedUI(running) {
+  document.getElementById('speed-btn').textContent =
+    running ? 'Abort Test' : 'Start Speed Test';
+}
+
+function toggleSpeedTest() {
+  const status = document.getElementById('speed-status');
+
+  if (st && st.getState() === 3) {
+    st.abort();
+    st = null;
+    speedUI(false);
+    status.innerHTML = '<span class="status-tag tag-warn">Aborted</span>';
+    return;
+  }
+
+  ['dl-speed','ul-speed','ping-val','jitter-val'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+  ['dl-note','ul-note'].forEach(id => { document.getElementById(id).textContent = ''; });
+
+  st = new Speedtest();
+  // All URLs are relative to speedtest_worker.js (served from the diag root)
+  st.setParameter('url_dl',   'testfiles/test-100m.bin');
+  st.setParameter('url_ul',   'api/st/up');
+  st.setParameter('url_ping', 'api/st/ping');
+  st.setParameter('url_getIp','api/st/getip');
+  st.setParameter('getIp_ispInfo', false);
+  st.setParameter('telemetry_level', 0);  // no telemetry, no database
+
+  st.onupdate = function (d) {
+    if (d.dlStatus)     document.getElementById('dl-speed').textContent   = d.dlStatus;
+    if (d.ulStatus)     document.getElementById('ul-speed').textContent   = d.ulStatus;
+    if (d.pingStatus)   document.getElementById('ping-val').textContent   = d.pingStatus;
+    if (d.jitterStatus) document.getElementById('jitter-val').textContent = d.jitterStatus;
+    document.getElementById('dl-note').textContent =
+      d.testState === 1 ? Math.round(d.dlProgress * 100) + '%' : '';
+    document.getElementById('ul-note').textContent =
+      d.testState === 3 ? Math.round(d.ulProgress * 100) + '%' : '';
+    const phase = {0:'Starting…',1:'Testing download…',2:'Testing ping…',3:'Testing upload…'}[d.testState];
+    if (phase)
+      status.innerHTML = '<span class="status-tag tag-info">' + phase + '</span>';
+  };
+
+  st.onend = function (aborted) {
+    speedUI(false);
+    document.getElementById('dl-note').textContent = '';
+    document.getElementById('ul-note').textContent = '';
+    if (!aborted)
+      status.innerHTML = '<span class="status-tag tag-ok">Done</span>';
+    st = null;
+  };
+
+  speedUI(true);
+  st.start();
+}
+</script>
+</body>
+</html>
