@@ -1,31 +1,88 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #################### x-ui-pro-refactor @ github.com/mozaroc #############################
+# A surprisingly common invocation is `sh start-script.sh`. Dash ignores the
+# shebang and later breaks Bash arrays/[[...]]. Re-exec the actual file in Bash.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -r "$0" ]; then
+        exec /usr/bin/env bash "$0" "$@"
+    fi
+    printf '%s\n' "This installer requires Bash. Run: sudo bash start-script.sh" >&2
+    exit 1
+fi
+
 [[ $EUID -ne 0 ]] && { echo "Run as root: sudo bash $0"; exit 1; }
 umask 077
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
-msg_ok()  { echo -e "\e[1;42m $1 \e[0m"; }
-msg_err() { echo -e "\e[1;41m $1 \e[0m"; }
-msg_inf() { echo -e "\e[1;34m$1\e[0m"; }
+msg_ok()  { printf '\033[1;42m %b \033[0m\n' "$*"; }
+msg_err() { printf '\033[1;41m %b \033[0m\n' "$*" >&2; }
+msg_inf() { printf '\033[1;34m%b\033[0m\n' "$*"; }
 
 # ─── Pre-flight checks ───────────────────────────────────────────────────────
+read_os_release_value() {
+    local key="$1" file="${OS_RELEASE_FILE:-/etc/os-release}"
+    awk -F= -v wanted="$key" '
+        $1 == wanted {
+            value = substr($0, index($0, "=") + 1)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]\r]+$/, "", value)
+            if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+                value = substr(value, 2, length(value) - 2)
+            }
+            print value
+            exit
+        }
+    ' "$file" 2>/dev/null
+}
+
 check_os() {
-    local os_id os_version
-    os_id=$(grep -oP '(?<=^ID=).+' /etc/os-release 2>/dev/null | tr -d '"')
-    os_version=$(grep -oP '(?<=^VERSION_ID=").+(?=")' /etc/os-release 2>/dev/null)
+    local os_id os_version os_major supported="false"
+    local os_file="${OS_RELEASE_FILE:-/etc/os-release}"
+
+    if [[ ! -r "$os_file" ]]; then
+        msg_err "Cannot read OS metadata: ${os_file}"
+        exit 1
+    fi
+
+    os_id=$(read_os_release_value ID)
+    os_version=$(read_os_release_value VERSION_ID)
+    os_id=$(printf '%s' "$os_id" | tr '[:upper:]' '[:lower:]')
+    # Accept VERSION_ID=12, VERSION_ID="12", and provider variants such as
+    # 12.7 or "12 (bookworm)". CRLF files are also normalized here.
+    os_id=$(printf '%s' "$os_id" | tr -d '[:space:]\r')
+    os_version=$(printf '%s' "$os_version" | tr -d '\r' | awk '{print $1}')
+    os_major=${os_version%%.*}
 
     case "${os_id}" in
         ubuntu)
-            [[ "$os_version" == "24.04" || "$os_version" == "26.04" ]] && return 0
+            [[ "$os_version" =~ ^(20\.04|22\.04|24\.04|26\.04)(\.[0-9]+)?$ ]] && supported="true"
             ;;
-        debian)
-            [[ "$os_version" == "12" || "$os_version" == "13" ]] && return 0
+        debian|raspbian)
+            [[ "$os_major" =~ ^(11|12|13)$ ]] && supported="true"
             ;;
     esac
 
-    msg_err "Unsupported OS: ${os_id} ${os_version}"
-    echo -e "\nThis script supports:\n  Ubuntu 24.04 / 26.04\n  Debian 12 / 13"
-    echo -e "\nPlease reinstall your server with one of the supported OS versions and try again."
+    if [[ "$supported" == "true" ]]; then
+        msg_inf "Detected supported OS: ${os_id} ${os_version}"
+        return 0
+    fi
+
+    # Useful for compatible derivatives and newer releases, but never silently
+    # claim they were tested. apt-get and systemd are hard requirements below.
+    if [[ "${ALLOW_UNSUPPORTED_OS:-0}" == "1" ]] \
+       && command -v apt-get >/dev/null 2>&1 \
+       && command -v systemctl >/dev/null 2>&1; then
+        msg_inf "Warning: continuing on untested OS '${os_id} ${os_version}' because ALLOW_UNSUPPORTED_OS=1."
+        return 0
+    fi
+
+    msg_err "Unsupported OS: id='${os_id:-unknown}' version='${os_version:-unknown}'"
+    printf '\n%s\n%s\n%s\n%s\n%s\n' \
+        "Supported systems:" \
+        "  Ubuntu 20.04 / 22.04 / 24.04 / 26.04" \
+        "  Debian 11 / 12 / 13" \
+        "  Raspbian 11 / 12 / 13" \
+        "For an apt/systemd-compatible derivative, retry with ALLOW_UNSUPPORTED_OS=1."
     exit 1
 }
 
@@ -34,12 +91,7 @@ check_cpu() {
     cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)
 
     if echo "$cpu_model" | grep -qi 'QEMU'; then
-        msg_err "QEMU virtual CPU detected!"
-        echo -e "\nYour VPS is running with an emulated QEMU processor."
-        echo -e "Please contact your hosting provider and ask them to switch the CPU type"
-        echo -e "to \e[1;33mhost-passthrough\e[0m (expose real CPU model to the VM)."
-        echo -e "\nThis is required for correct operation of the Xray core."
-        exit 1
+        msg_inf "Warning: generic QEMU CPU detected. Xray should work, but host-passthrough may improve performance."
     fi
 }
 
@@ -156,8 +208,15 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-# ─── Detect package manager ───────────────────────────────────────────────────
-Pak=$(type apt &>/dev/null && echo "apt" || echo "yum")
+# ─── Package/service requirements ────────────────────────────────────────────
+if ! command -v apt-get >/dev/null 2>&1; then
+    msg_err "This build currently requires an apt-based system (apt-get not found)."
+    exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1; then
+    msg_err "systemd is required (systemctl not found)."
+    exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # UNINSTALL
@@ -220,7 +279,7 @@ validate_domains() {
         echo -en "Enter available subdomain (sub.domain.tld): " && read -r domain
     done
     domain=$(echo "$domain" | tr -d '[:space:]')
-    domain=${domain,,}
+    domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
     if [[ ${#domain} -gt 253 || ! "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
         msg_err "Invalid panel domain: ${domain}"
         exit 1
@@ -234,7 +293,7 @@ validate_domains() {
         echo -en "Enter available subdomain for REALITY (sub.domain.tld): " && read -r reality_domain
     done
     reality_domain=$(echo "$reality_domain" | tr -d '[:space:]')
-    reality_domain=${reality_domain,,}
+    reality_domain=$(printf '%s' "$reality_domain" | tr '[:upper:]' '[:lower:]')
     if [[ ${#reality_domain} -gt 253 || ! "$reality_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
         msg_err "Invalid REALITY domain: ${reality_domain}"
         exit 1
@@ -254,12 +313,16 @@ validate_domains() {
 # ─────────────────────────────────────────────────────────────────────────────
 install_packages() {
     if [[ ${INSTALL} == *"y"* ]]; then
-        local version
-        version=$(grep -oP '(?<=VERSION_ID=")[0-9]+' /etc/os-release)
-        [[ "$version" == "20" || "$version" == "22" ]] && echo "System: Ubuntu $version"
-
-        $Pak -y update
-        $Pak -y install curl wget jq bash sudo nginx-full certbot python3-certbot-nginx sqlite3 ufw netcat-openbsd mtr python3 libcap2-bin openssl
+        local nginx_package="nginx-full"
+        local -a nginx_extra=()
+        apt-get update
+        if ! apt-cache show nginx-full >/dev/null 2>&1; then
+            nginx_package="nginx"
+            nginx_extra+=(libnginx-mod-stream)
+        fi
+        apt-get install -y curl wget jq bash sudo "$nginx_package" "${nginx_extra[@]}" \
+            certbot python3-certbot-nginx sqlite3 ufw netcat-openbsd mtr python3 \
+            libcap2-bin openssl ca-certificates
         systemctl daemon-reload && systemctl enable --now nginx
     fi
 
