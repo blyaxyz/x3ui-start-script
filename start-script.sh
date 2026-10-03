@@ -137,6 +137,7 @@ config_username=""
 config_password=""
 diag_path=""
 diag_token=""
+SUB_UPSTREAM_SCHEME=""
 
 usage() {
     cat <<'EOF'
@@ -546,11 +547,41 @@ get_ssl_certs() {
     ln -sfn "$key"  "/root/cert/${domain}/privkey.pem"
 }
 
+detect_subscription_transport() {
+    local attempt code
+    for attempt in {1..20}; do
+        : "$attempt"
+        code=$(curl -ksS -o /dev/null -w '%{http_code}' --noproxy '*' \
+            --connect-timeout 2 --max-time 4 \
+            "https://127.0.0.1:${sub_port}/${sub_path}/" 2>/dev/null || true)
+        if [[ "$code" != "000" && "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+            SUB_UPSTREAM_SCHEME="https"
+            msg_inf "Subscription listener detected: HTTPS on 127.0.0.1:${sub_port}."
+            return 0
+        fi
+
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --noproxy '*' \
+            --connect-timeout 2 --max-time 4 \
+            "http://127.0.0.1:${sub_port}/${sub_path}/" 2>/dev/null || true)
+        if [[ "$code" != "000" && "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+            SUB_UPSTREAM_SCHEME="http"
+            msg_inf "Subscription listener detected: HTTP on 127.0.0.1:${sub_port}."
+            return 0
+        fi
+        sleep 1
+    done
+
+    journalctl -u x-ui.service -n 40 --no-pager >&2 || true
+    die "Could not detect the 3x-ui subscription transport on port ${sub_port}."
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURE NGINX
 # ─────────────────────────────────────────────────────────────────────────────
 configure_nginx() {
     local previous_domain candidate candidate_name
+    [[ "$SUB_UPSTREAM_SCHEME" == "http" || "$SUB_UPSTREAM_SCHEME" == "https" ]] \
+        || die "Subscription upstream transport was not detected."
     previous_domain=$(read_state_value DOMAIN || true)
     if [[ -n "$previous_domain" && "$previous_domain" != "$domain" ]]; then
         valid_hostname "$previous_domain" || die "Existing state contains an invalid panel domain."
@@ -627,7 +658,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${sub_port};
+        proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port};
     }
     location = /${sub_path} {
         if (\$hack = 1) { return 404; }
@@ -635,7 +666,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${sub_port};
+        proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port};
     }
     # Regex takes priority over prefix: catches subscription IDs (one-level deep)
     # and routes Clash/Mihomo clients to dynamic clash.yaml generator
@@ -646,10 +677,10 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${sub_port};
+        proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port};
     }
-    location /assets  { proxy_pass http://127.0.0.1:${sub_port}; }
-    location /assets/ { proxy_pass http://127.0.0.1:${sub_port}; }
+    location /assets  { proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port}; }
+    location /assets/ { proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port}; }
 
     #Subscription (json)
     location /${json_path} {
@@ -658,7 +689,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${sub_port};
+        proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port};
     }
     location /${json_path}/ {
         if (\$hack = 1) { return 404; }
@@ -666,7 +697,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${sub_port};
+        proxy_pass ${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port};
     }
 
     #XHTTP
@@ -1215,8 +1246,8 @@ INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgCpu",              
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgLang",              'en-US');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("timeLocation",        'Local');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subDomain",           '');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subCertFile",         '');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subKeyFile",          '');
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subCertFile",         '/root/cert/${domain}/fullchain.pem');
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subKeyFile",          '/root/cert/${domain}/privkey.pem');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subUpdates",          '12');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subEncrypt",          'true');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonMux",          '');
@@ -1746,7 +1777,8 @@ persist_install_state() {
 health_check() {
     local -a services=(x-ui nginx mtr-backend)
     local -a ports=(443 7443 8443 "$panel_port" "$sub_port" "$ws_port" "$trojan_port" "$mtr_backend_port")
-    local service port attempt http_code sub_code
+    local service port attempt http_code sub_code sub_url
+    local -a sub_curl_tls=()
     nginx -t
     for service in "${services[@]}"; do
         systemctl is-active --quiet "$service" || die "Health check failed: $service is not active."
@@ -1765,8 +1797,10 @@ health_check() {
         || die "Health check failed: panel HTTPS request could not be completed."
     [[ "$http_code" =~ ^(200|301|302|303|307|308|401|403)$ ]] \
         || die "Health check failed: panel returned HTTP $http_code."
-    sub_code=$(curl -sS -o /dev/null -w '%{http_code}' \
-        --noproxy '*' --connect-timeout 3 --max-time 10 "http://127.0.0.1:${sub_port}/${sub_path}/") \
+    sub_url="${SUB_UPSTREAM_SCHEME}://127.0.0.1:${sub_port}/${sub_path}/"
+    [[ "$SUB_UPSTREAM_SCHEME" != "https" ]] || sub_curl_tls=(-k)
+    sub_code=$(curl -sS "${sub_curl_tls[@]}" -o /dev/null -w '%{http_code}' \
+        --noproxy '*' --connect-timeout 3 --max-time 10 "$sub_url") \
         || die "Health check failed: subscription server is unreachable."
     [[ "$sub_code" != "000" && "$sub_code" != 5* ]] \
         || die "Health check failed: subscription server returned HTTP $sub_code."
@@ -1803,6 +1837,7 @@ main() {
     get_ssl_certs
     install_panel
     configure_xui_db
+    detect_subscription_transport
     install_clash_sub
     install_fake_site
     install_diagnostics

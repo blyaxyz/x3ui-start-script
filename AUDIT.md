@@ -97,9 +97,12 @@ relying on firewall rules for isolation.
 
 ### High: broken subscription upstream protocol — fixed
 
-3x-ui serves subscriptions over plain HTTP when `subCertFile` and `subKeyFile`
-are empty. The nginx upstream now uses HTTP, while public TLS still terminates
-at nginx. JSON subscriptions are explicitly enabled with `subJsonEnable=true`.
+3x-ui may serve subscriptions over HTTP or HTTPS depending on its certificate
+settings and release behavior. The installer now configures a certificate
+explicitly, probes the live listener after restart, and generates the nginx
+upstream with the detected transport. This also avoids 3x-ui's malformed
+`HTTP/0.0` auto-HTTPS redirect when a TLS listener receives plain HTTP. JSON
+subscriptions are explicitly enabled with `subJsonEnable=true`.
 
 ### Medium: global system mutation and resource exhaustion — fixed
 
