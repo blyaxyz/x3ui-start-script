@@ -12,11 +12,13 @@ fi
 
 [[ $EUID -ne 0 ]] && { echo "Run as root: sudo bash $0"; exit 1; }
 umask 077
+set -Euo pipefail
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
 msg_ok()  { printf '\033[1;42m %b \033[0m\n' "$*"; }
 msg_err() { printf '\033[1;41m %b \033[0m\n' "$*" >&2; }
 msg_inf() { printf '\033[1;34m%b\033[0m\n' "$*"; }
+die()     { msg_err "$*"; exit 1; }
 
 # ─── Pre-flight checks ───────────────────────────────────────────────────────
 read_os_release_value() {
@@ -88,53 +90,158 @@ check_os() {
 
 check_cpu() {
     local cpu_model
-    cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2-)
+    cpu_model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- || true)
 
     if echo "$cpu_model" | grep -qi 'QEMU'; then
         msg_inf "Warning: generic QEMU CPU detected. Xray should work, but host-passthrough may improve performance."
     fi
 }
 
-check_os
-check_cpu
-
 # ─── Constants ───────────────────────────────────────────────────────────────
 XUIDB="/etc/x-ui/x-ui.db"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 ASSET_DIR="${ASSET_DIR:-${SCRIPT_DIR}/assets}"
+STATE_DIR="/etc/3x-ui-pro"
+STATE_FILE="${STATE_DIR}/state.env"
+SYSCTL_FILE="/etc/sysctl.d/99-3x-ui-pro.conf"
+NGINX_BEGIN="# BEGIN 3X-UI-PRO MANAGED BLOCK"
+NGINX_END="# END 3X-UI-PRO MANAGED BLOCK"
 
 # ─── Default argument values ─────────────────────────────────────────────────
 domain=""
 reality_domain=""
-UNINSTALL="x"
-INSTALL="y"
-AUTODOMAIN="n"
+UNINSTALL="no"
+INSTALL="yes"
+PANEL_VERSION=""
+IP4=""
+IP6=""
+SSH_PORT="${SSH_PORT:-}"
+WORK_DIR=""
+ROLLBACK_DIR=""
+ROLLBACK_ACTIVE=0
+NGINX_STOPPED_BY_US=0
+PANEL_TAG=""
+LAST_ERROR=""
+sub_port=""
+panel_port=""
+ws_port=""
+trojan_port=""
+mtr_backend_port=""
+sub_path=""
+json_path=""
+panel_path=""
+ws_path=""
+trojan_path=""
+xhttp_path=""
+config_username=""
+config_password=""
+diag_path=""
+diag_token=""
 
-# ─── Stop & clean previous install (called from main, after domain validation) ─
-clean_previous_install() {
-    systemctl stop x-ui 2>/dev/null || true
-    if [[ -f "$XUIDB" ]]; then
-        local backup_dir
-        backup_dir="/root/3x-ui-pro-backups/$(date +%Y%m%d-%H%M%S)"
-        install -d -m 700 "$backup_dir"
-        install -m 600 "$XUIDB" "$backup_dir/x-ui.db"
-        msg_inf "Existing database backed up to ${backup_dir}/x-ui.db"
-    fi
-    rm -f /etc/systemd/system/x-ui.service
-    rm -rf /usr/local/x-ui
-    rm -rf /etc/x-ui
-    # Remove only files owned by this installer. Other nginx sites belong to
-    # the administrator and must survive a panel reinstall.
-    rm -f /etc/nginx/sites-enabled/00-maps.conf \
-          /etc/nginx/sites-enabled/80.conf \
-          "/etc/nginx/sites-enabled/${domain}" \
-          "/etc/nginx/sites-enabled/${reality_domain}"
-    rm -f /etc/nginx/sites-available/00-maps.conf \
-          /etc/nginx/sites-available/80.conf \
-          "/etc/nginx/sites-available/${domain}" \
-          "/etc/nginx/sites-available/${reality_domain}" \
-          /etc/nginx/stream-enabled/stream.conf \
-          /etc/nginx/snippets/includes.conf
+usage() {
+    cat <<'EOF'
+Usage: sudo bash start-script.sh [options]
+  -subdomain DOMAIN             Panel domain owned by you
+  -reality_target HOST          External TLS 1.3 camouflage host
+  -reality_domain HOST          Legacy alias for -reality_target
+  -version X.Y.Z                Pin a 3x-ui release (minimum 3.5.0)
+  -install yes|no               Install missing OS packages (default: yes)
+  -uninstall yes                Remove this installation
+  --help                        Show this help
+
+Environment: PANEL_SHA256, SSH_PORT, ALLOW_UNSUPPORTED_OS=1,
+SKIP_REALITY_TARGET_CHECK=1, SKIP_FIREWALL=1.
+EOF
+}
+
+need_value() {
+    [[ $# -ge 2 && -n "$2" && "$2" != -* ]] \
+        || die "Option $1 requires a value."
+}
+
+normalize_bool() {
+    local normalized
+    normalized=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$normalized" in
+        y|yes|true|1) echo yes ;;
+        n|no|false|0) echo no ;;
+        *) return 1 ;;
+    esac
+}
+
+while (($#)); do
+    case "$1" in
+        -install)
+            need_value "$@"
+            INSTALL=$(normalize_bool "$2") || die "-install accepts only yes/no."
+            shift 2
+            ;;
+        -subdomain)
+            need_value "$@"; domain="$2"; shift 2
+            ;;
+        -reality_domain|-reality_target)
+            need_value "$@"; reality_domain="$2"; shift 2
+            ;;
+        -version)
+            need_value "$@"; PANEL_VERSION="$2"; shift 2
+            ;;
+        -uninstall)
+            need_value "$@"
+            UNINSTALL=$(normalize_bool "$2") || die "-uninstall accepts only yes/no."
+            shift 2
+            ;;
+        -ONLY_CF_IP_ALLOW)
+            die "-ONLY_CF_IP_ALLOW is not implemented; refusing to ignore it."
+            ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; (($# == 0)) || die "Unexpected positional arguments: $*" ;;
+        -*) die "Unknown option: $1" ;;
+        *)  die "Unexpected positional argument: $1" ;;
+    esac
+done
+
+if [[ "$UNINSTALL" != "yes" ]]; then
+    check_os
+    check_cpu
+fi
+
+valid_hostname() {
+    local value
+    value=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    [[ ${#value} -le 253 \
+       && "$value" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
+}
+
+read_state_value() {
+    local key="$1"
+    [[ -r "$STATE_FILE" ]] || return 1
+    sed -n "s/^${key}=//p" "$STATE_FILE" | head -n1
+}
+
+remove_nginx_managed_block() {
+    local file="/etc/nginx/nginx.conf" tmp
+    [[ -f "$file" ]] || return 0
+    tmp=$(mktemp)
+    awk -v begin="$NGINX_BEGIN" -v end="$NGINX_END" '
+        $0 == begin {skip=1; next}
+        $0 == end {skip=0; next}
+        $0 == "stream { include /etc/nginx/stream-enabled/*.conf; }" {next}
+        $0 == "worker_rlimit_nofile 16384;" {next}
+        !skip {print}
+    ' "$file" > "$tmp"
+    sed -i '1s|^load_module /usr/lib/nginx/modules/ngx_stream_module.so; ||' "$tmp"
+    install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+}
+
+# ─── Existing installation backup ────────────────────────────────────────────
+backup_existing_database() {
+    [[ -f "$XUIDB" ]] || return 0
+    local backup_dir
+    backup_dir="/root/3x-ui-pro-backups/$(date +%Y%m%d-%H%M%S)-$$"
+    install -d -m 700 "$backup_dir"
+    install -m 600 "$XUIDB" "$backup_dir/x-ui.db"
+    msg_inf "Existing database backed up to ${backup_dir}/x-ui.db"
 }
 
 verify_local_assets() {
@@ -146,67 +253,57 @@ verify_local_assets() {
 
 # ─── Port / path generators ──────────────────────────────────────────────────
 get_port() {
-    echo $(( ((RANDOM<<15)|RANDOM) % 49152 + 10000 ))
+    echo $(( ((RANDOM<<15)|RANDOM) % 50000 + 10000 ))
 }
 
 gen_random_string() {
-    local length="$1"
-    head -c 4096 /dev/urandom | tr -dc 'a-zA-Z0-9' | head -c "$length"
-    echo
+    local length="$1" value
+    value=$(openssl rand -hex "$(((length + 1) / 2))")
+    printf '%s\n' "${value:0:length}"
 }
 
 # Matches the panel's host group_id format (16 lowercase alphanumerics)
 gen_group_id() {
-    head -c 4096 /dev/urandom | tr -dc 'a-z0-9' | head -c 16
-    echo
+    openssl rand -hex 8
 }
 
-check_free() {
-    nc -z 127.0.0.1 "$1" &>/dev/null
-    return $?
+port_in_use() {
+    local port="$1"
+    ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
 }
 
 make_port() {
+    local destination="$1" port attempts=0 used
     while true; do
-        local PORT
-        PORT=$(get_port)
-        if ! check_free "$PORT"; then
-            echo "$PORT"
-            break
+        port=$(get_port)
+        used=" ${RESERVED_PORTS[*]:-} "
+        if ! port_in_use "$port" && [[ "$used" != *" ${port} "* ]]; then
+            RESERVED_PORTS+=("$port")
+            printf -v "$destination" '%s' "$port"
+            return 0
         fi
+        ((++attempts < 500)) || die "Could not allocate a free local port."
     done
 }
 
-# ─── Generate ports & paths (done once at startup) ───────────────────────────
-sub_port=$(make_port)
-panel_port=$(make_port)
-ws_port=$(make_port)
-trojan_port=$(make_port)
-
-sub_path=$(gen_random_string 10)
-json_path=$(gen_random_string 10)
-panel_path=$(gen_random_string 10)
-ws_path=$(gen_random_string 10)
-trojan_path=$(gen_random_string 10)
-xhttp_path=$(gen_random_string 10)
-config_username=$(gen_random_string 10)
-config_password=$(gen_random_string 10)
-diag_path="/net-$(gen_random_string 12)/"
-diag_token=$(gen_random_string 16)
-mtr_backend_port=$(make_port)
-
-# ─── Argument parsing ────────────────────────────────────────────────────────
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        -install)          INSTALL="$2";           shift 2 ;;
-        -subdomain)        domain="$2";            shift 2 ;;
-        -reality_domain)   reality_domain="$2";    shift 2 ;;
-        -ONLY_CF_IP_ALLOW) msg_err "-ONLY_CF_IP_ALLOW is not implemented; refusing to ignore it."; exit 2 ;;
-        -version)          PANEL_VERSION="$2";     shift 2 ;;
-        -uninstall)        UNINSTALL="$2";         shift 2 ;;
-        *)                 shift 1 ;;
-    esac
-done
+generate_install_values() {
+    RESERVED_PORTS=(7443 8443)
+    make_port sub_port
+    make_port panel_port
+    make_port ws_port
+    make_port trojan_port
+    make_port mtr_backend_port
+    sub_path=$(gen_random_string 16)
+    json_path=$(gen_random_string 16)
+    panel_path=$(gen_random_string 16)
+    ws_path=$(gen_random_string 16)
+    trojan_path=$(gen_random_string 16)
+    xhttp_path=$(gen_random_string 16)
+    config_username=$(gen_random_string 16)
+    config_password=$(gen_random_string 24)
+    diag_path="/net-$(gen_random_string 20)/"
+    diag_token=$(gen_random_string 32)
+}
 
 # ─── Package/service requirements ────────────────────────────────────────────
 if ! command -v apt-get >/dev/null 2>&1; then
@@ -222,156 +319,252 @@ fi
 # UNINSTALL
 # ─────────────────────────────────────────────────────────────────────────────
 uninstall_xui() {
-    printf 'y\n' | x-ui uninstall 2>/dev/null || true
+    local installed_domain=""
+    installed_domain=$(read_state_value DOMAIN || true)
+    if [[ -n "$domain" ]]; then
+        domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+        valid_hostname "$domain" || die "Invalid panel domain: $domain"
+        if [[ -n "$installed_domain" && "$domain" != "$installed_domain" ]]; then
+            die "Refusing to remove vhost '$domain': installed domain is '$installed_domain'."
+        fi
+        installed_domain="$domain"
+    fi
+    [[ -z "$installed_domain" ]] || valid_hostname "$installed_domain" \
+        || die "State file contains an invalid domain; remove it manually after inspection."
+
+    systemctl stop x-ui mtr-backend 2>/dev/null || true
+    systemctl disable x-ui mtr-backend 2>/dev/null || true
     rm -rf /etc/x-ui/ /usr/local/x-ui/
     rm -f  /usr/bin/x-ui
-    rm -rf /var/www/diagnostics/ /var/www/subpage/
-    rm -f /var/www/html/index.html
+    rm -rf /var/www/diagnostics/ /var/www/subpage/ /var/www/3x-ui-pro-cover/
     rm -f /etc/nginx/stream-enabled/stream.conf \
           /etc/nginx/sites-enabled/00-maps.conf \
           /etc/nginx/sites-enabled/80.conf \
+          /etc/nginx/sites-enabled/3x-ui-pro-maps.conf \
+          /etc/nginx/sites-enabled/3x-ui-pro-http.conf \
           /etc/nginx/sites-available/00-maps.conf \
           /etc/nginx/sites-available/80.conf \
+          /etc/nginx/sites-available/3x-ui-pro-maps.conf \
+          /etc/nginx/sites-available/3x-ui-pro-http.conf \
           /etc/nginx/snippets/includes.conf \
-          /etc/cron.d/3x-ui-pro
-    if [[ -n "$domain" ]]; then
-        rm -f "/etc/nginx/sites-enabled/${domain}" "/etc/nginx/sites-available/${domain}"
+          /etc/cron.d/3x-ui-pro \
+          /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx \
+          /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services \
+          "$SYSCTL_FILE"
+    if [[ -n "$installed_domain" ]]; then
+        rm -f "/etc/nginx/sites-enabled/${installed_domain}" \
+              "/etc/nginx/sites-available/${installed_domain}"
     fi
-    if [[ -n "$reality_domain" ]]; then
-        rm -f "/etc/nginx/sites-enabled/${reality_domain}" "/etc/nginx/sites-available/${reality_domain}"
-    fi
-    systemctl stop mtr-backend 2>/dev/null || true
-    systemctl disable mtr-backend 2>/dev/null || true
     rm -f /etc/systemd/system/mtr-backend.service
     rm -rf /usr/local/lib/3x-ui-pro/
+    remove_nginx_managed_block
+    rm -rf "$STATE_DIR"
     systemctl daemon-reload 2>/dev/null || true
+    systemctl is-active --quiet nginx && systemctl reload nginx 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
 }
 
-if [[ ${UNINSTALL} == *"y"* ]]; then
+if [[ "$UNINSTALL" == "yes" ]]; then
     uninstall_xui
-    clear && msg_ok "Completely Uninstalled!" && exit 0
+    msg_ok "3x-ui-pro components were removed. Existing firewall rules were preserved."
+    exit 0
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GET SERVER IP
 # ─────────────────────────────────────────────────────────────────────────────
-IP4_REGEX="^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
-IP6_REGEX="([a-f0-9:]+:+)+[a-f0-9]+"
-
-get_server_ip() {
-    IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
-    IP6=$(ip route get 2620:fe::fe 2>&1 | grep -Po -- 'src \K\S*')
-    [[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
-    [[ $IP6 =~ $IP6_REGEX ]] || IP6=$(curl -s ipv6.icanhazip.com | tr -d '[:space:]')
+valid_ipv4() {
+    local ip="$1" a b c d
+    IFS=. read -r a b c d <<< "$ip"
+    [[ -n "${d:-}" && ${#a} -le 3 && ${#b} -le 3 && ${#c} -le 3 && ${#d} -le 3 \
+       && "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ \
+       && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+    ((10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 && 10#$d <= 255))
 }
 
-# Early IP fetch for auto-domain
-IP4=$(ip route get 8.8.8.8 2>&1 | grep -Po -- 'src \K\S*')
-[[ $IP4 =~ $IP4_REGEX ]] || IP4=$(curl -s ipv4.icanhazip.com | tr -d '[:space:]')
+get_server_ip() {
+    IP4=$(curl -4fsS --connect-timeout 5 --max-time 10 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
+    valid_ipv4 "$IP4" || IP4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)
+    valid_ipv4 "$IP4" || die "Could not determine a valid public/server IPv4 address."
+    IP6=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || true)
+    if [[ -z "$IP6" || "$IP6" != *:* ]]; then
+        IP6=$(curl -6fsS --connect-timeout 5 --max-time 10 https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    [[ "$IP6" == *:* ]] || IP6=""
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DOMAIN VALIDATION
 # ─────────────────────────────────────────────────────────────────────────────
 validate_domains() {
+    if [[ ! -t 0 && -z "$domain" ]]; then
+        die "Non-interactive installation requires -subdomain DOMAIN."
+    fi
     while true; do
         [[ -n "$domain" ]] && break
-        echo -en "Enter available subdomain (sub.domain.tld): " && read -r domain
+        printf '%s' "Enter your panel domain (DNS must point to this VPS): "
+        read -r domain
     done
     domain=$(echo "$domain" | tr -d '[:space:]')
     domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
-    if [[ ${#domain} -gt 253 || ! "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+    if ! valid_hostname "$domain"; then
         msg_err "Invalid panel domain: ${domain}"
         exit 1
     fi
-    SubDomain=$(echo "$domain"   | sed 's/^[^ ]* \|\..*//g')
-    MainDomain=$(echo "$domain"  | sed 's/.*\.\([^.]*\..*\)$/\1/')
-    [[ "${SubDomain}.${MainDomain}" != "${domain}" ]] && MainDomain=${domain}
 
+    if [[ ! -t 0 && -z "$reality_domain" ]]; then
+        die "Non-interactive installation requires -reality_target HOST."
+    fi
     while true; do
         [[ -n "$reality_domain" ]] && break
-        echo -en "Enter available subdomain for REALITY (sub.domain.tld): " && read -r reality_domain
+        printf '%s' "Enter REALITY camouflage target (public TLS hostname, e.g. www.microsoft.com): "
+        read -r reality_domain
     done
     reality_domain=$(echo "$reality_domain" | tr -d '[:space:]')
     reality_domain=$(printf '%s' "$reality_domain" | tr '[:upper:]' '[:lower:]')
-    if [[ ${#reality_domain} -gt 253 || ! "$reality_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
-        msg_err "Invalid REALITY domain: ${reality_domain}"
+    if ! valid_hostname "$reality_domain"; then
+        msg_err "Invalid REALITY camouflage hostname: ${reality_domain}"
         exit 1
     fi
-    RealitySubDomain=$(echo "$reality_domain" | sed 's/^[^ ]* \|\..*//g')
-    RealityMainDomain=$(echo "$reality_domain" | sed 's/.*\.\([^.]*\..*\)$/\1/')
-    [[ "${RealitySubDomain}.${RealityMainDomain}" != "${reality_domain}" ]] && RealityMainDomain=${reality_domain}
 
     if [[ "$domain" == "$reality_domain" ]]; then
-        msg_err "Panel domain and REALITY domain must be different! Got: ${domain}"
+        msg_err "Panel domain and external REALITY target must be different: ${domain}"
         exit 1
     fi
+}
+
+validate_reality_target() {
+    if [[ "${SKIP_REALITY_TARGET_CHECK:-0}" == "1" ]]; then
+        msg_inf "Warning: REALITY target validation skipped by operator request."
+        return 0
+    fi
+
+    local resolved tls_output cert_file
+    resolved=$(getent ahosts "$reality_domain" 2>/dev/null | awk '{print $1}' | sort -u)
+    if [[ -z "$resolved" ]]; then
+        msg_err "REALITY target does not resolve: ${reality_domain}"
+        exit 1
+    fi
+    if printf '%s\n' "$resolved" | grep -Fxq -- "$IP4" \
+       || { [[ -n "${IP6:-}" ]] && printf '%s\n' "$resolved" | grep -Fxq -- "$IP6"; }; then
+        msg_err "REALITY target resolves to this VPS. Choose an external TLS website to avoid a forwarding loop."
+        exit 1
+    fi
+
+    tls_output=$(mktemp)
+    cert_file=$(mktemp)
+    if ! timeout 15 openssl s_client -connect "${reality_domain}:443" \
+        -servername "$reality_domain" -tls1_3 -alpn h2 < /dev/null \
+        >"$tls_output" 2>/dev/null; then
+        rm -f "$tls_output" "$cert_file"
+        msg_err "REALITY target failed a TLS 1.3 handshake: ${reality_domain}:443"
+        exit 1
+    fi
+    sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
+        "$tls_output" | sed -n '1,/-----END CERTIFICATE-----/p' > "$cert_file"
+    if ! openssl x509 -in "$cert_file" -noout -checkhost "$reality_domain" >/dev/null 2>&1; then
+        rm -f "$tls_output" "$cert_file"
+        msg_err "REALITY target certificate does not cover ${reality_domain}."
+        exit 1
+    fi
+    if ! grep -Fq 'ALPN protocol: h2' "$tls_output"; then
+        msg_inf "Warning: ${reality_domain} did not negotiate HTTP/2; choose another target for better camouflage."
+    fi
+    rm -f "$tls_output" "$cert_file"
+    msg_ok "REALITY camouflage target validated: ${reality_domain}:443"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INSTALL PACKAGES
 # ─────────────────────────────────────────────────────────────────────────────
 install_packages() {
-    if [[ ${INSTALL} == *"y"* ]]; then
-        local nginx_package="nginx-full"
-        local -a nginx_extra=()
-        apt-get update
-        if ! apt-cache show nginx-full >/dev/null 2>&1; then
-            nginx_package="nginx"
-            nginx_extra+=(libnginx-mod-stream)
-        fi
-        apt-get install -y curl wget jq bash sudo "$nginx_package" "${nginx_extra[@]}" \
-            certbot python3-certbot-nginx sqlite3 ufw netcat-openbsd mtr python3 \
-            libcap2-bin openssl ca-certificates
-        systemctl daemon-reload && systemctl enable --now nginx
+    local -a packages=(curl wget jq bash sudo certbot sqlite3 ufw mtr-tiny
+        python3 libcap2-bin openssl ca-certificates iproute2 tar coreutils cron kmod)
+    if [[ "$INSTALL" == "yes" ]]; then
+        msg_inf "Refreshing OS package metadata..."
+        DEBIAN_FRONTEND=noninteractive apt-get update
+    fi
+    if apt-cache show libnginx-mod-stream >/dev/null 2>&1; then
+        packages+=(nginx libnginx-mod-stream)
+    elif apt-cache show nginx-full >/dev/null 2>&1; then
+        packages+=(nginx-full)
+    elif [[ "$INSTALL" == "yes" ]]; then
+        die "No nginx stream module package is available for this OS."
     fi
 
-    apt-get install -yqq --no-install-recommends ca-certificates
+    if [[ "$INSTALL" == "yes" ]]; then
+        msg_inf "Installing required OS packages..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+    fi
+
+    local cmd
+    for cmd in curl wget jq nginx certbot sqlite3 ufw mtr python3 openssl ss tar systemctl; do
+        command -v "$cmd" >/dev/null 2>&1 || die "Required command is missing: $cmd (use -install yes)."
+    done
+    systemctl daemon-reload
+    systemctl enable nginx
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SSL CERTIFICATES
 # ─────────────────────────────────────────────────────────────────────────────
 get_ssl_certs() {
-    systemctl stop nginx 2>/dev/null || true
-
-    if [[ ${AUTODOMAIN} == *"y"* ]]; then
-        local resolve_ok=true
-        for d in "$domain" "$reality_domain"; do
-            local a
-            a=$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1{print $1}')
-            if [[ "$a" != "$IP4" ]]; then
-                msg_err "Auto-domain $d does not resolve to $IP4. Fix DNS and retry."
-                resolve_ok=false
-            fi
-        done
-        [[ $resolve_ok == false ]] && exit 1
+    local cert_dir="/etc/letsencrypt/live/${domain}" resolved4 cert key
+    cert="${cert_dir}/fullchain.pem"
+    key="${cert_dir}/privkey.pem"
+    resolved4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)
+    [[ -n "$resolved4" ]] || die "Panel domain does not have an IPv4 DNS record: $domain"
+    if ! grep -Fxq "$IP4" <<< "$resolved4"; then
+        msg_inf "Warning: $domain does not resolve directly to detected IPv4 $IP4 (a reverse proxy/CDN may be in use)."
     fi
 
-    certbot certonly --standalone --non-interactive --agree-tos \
-        --register-unsafely-without-email -d "$domain"
-    if [[ ! -d "/etc/letsencrypt/live/${domain}/" ]]; then
-        systemctl start nginx >/dev/null 2>&1
-        msg_err "$domain SSL could not be generated! Check Domain/IP." && exit 1
+    if systemctl is-active --quiet nginx; then
+        NGINX_STOPPED_BY_US=1
+        systemctl stop nginx
     fi
 
-    certbot certonly --standalone --non-interactive --agree-tos \
-        --register-unsafely-without-email -d "$reality_domain"
-    if [[ ! -d "/etc/letsencrypt/live/${reality_domain}/" ]]; then
-        systemctl start nginx >/dev/null 2>&1
-        msg_err "$reality_domain SSL could not be generated! Check Domain/IP." && exit 1
+    if ! certbot certonly --standalone --non-interactive --agree-tos \
+        --register-unsafely-without-email --keep-until-expiring -d "$domain"; then
+        ((NGINX_STOPPED_BY_US == 0)) || systemctl start nginx || true
+        NGINX_STOPPED_BY_US=0
+        die "Certificate issuance failed for $domain. Verify DNS and inbound TCP/80."
     fi
 
-    mkdir -p /root/cert/${domain}
-    chmod 755 /root/cert/*
-    ln -sf /etc/letsencrypt/live/${domain}/fullchain.pem /root/cert/${domain}/fullchain.pem
-    ln -sf /etc/letsencrypt/live/${domain}/privkey.pem   /root/cert/${domain}/privkey.pem
+    ((NGINX_STOPPED_BY_US == 0)) || systemctl start nginx
+    NGINX_STOPPED_BY_US=0
+    [[ -s "$cert" && -s "$key" ]] || die "Certbot succeeded but certificate files are missing for $domain."
+    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1 \
+        || die "Certificate does not cover $domain."
+    openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null 2>&1 \
+        || die "Certificate for $domain expires in less than 24 hours."
+
+    install -d -m 700 "/root/cert/${domain}"
+    ln -sfn "$cert" "/root/cert/${domain}/fullchain.pem"
+    ln -sfn "$key"  "/root/cert/${domain}/privkey.pem"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURE NGINX
 # ─────────────────────────────────────────────────────────────────────────────
 configure_nginx() {
+    local previous_domain candidate candidate_name
+    previous_domain=$(read_state_value DOMAIN || true)
+    if [[ -n "$previous_domain" && "$previous_domain" != "$domain" ]]; then
+        valid_hostname "$previous_domain" || die "Existing state contains an invalid panel domain."
+        rm -f "/etc/nginx/sites-enabled/${previous_domain}" \
+              "/etc/nginx/sites-available/${previous_domain}"
+    fi
+    # Migrate installations made before the state manifest existed. Remove
+    # only vhosts carrying this installer's distinctive diagnostics marker.
+    for candidate in /etc/nginx/sites-available/*; do
+        [[ -f "$candidate" ]] || continue
+        candidate_name=${candidate##*/}
+        [[ "$candidate_name" == "$domain" ]] && continue
+        if grep -Fq '# Diagnostics SSO bridge' "$candidate"; then
+            rm -f "/etc/nginx/sites-enabled/${candidate_name}" "$candidate"
+        fi
+    done
     mkdir -p /etc/nginx/stream-enabled /etc/nginx/snippets
 
     # nginx >= 1.25.1 deprecates "listen ... http2" in favor of "http2 on;";
@@ -406,19 +599,19 @@ server {
 }
 EOF
 
-    grep -xqFR "stream { include /etc/nginx/stream-enabled/*.conf; }" /etc/nginx/* \
-        || echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
-    grep -xqFR "load_module modules/ngx_stream_module.so;" /etc/nginx/* \
-        || sed -i '1s/^/load_module \/usr\/lib\/nginx\/modules\/ngx_stream_module.so; /' /etc/nginx/nginx.conf
-    grep -xqFR "worker_rlimit_nofile 16384;" /etc/nginx/* \
-        || echo "worker_rlimit_nofile 16384;" >> /etc/nginx/nginx.conf
-    sed -i "/worker_connections/c\worker_connections 4096;" /etc/nginx/nginx.conf
+    remove_nginx_managed_block
+    cat >> /etc/nginx/nginx.conf <<EOF
+
+${NGINX_BEGIN}
+stream { include /etc/nginx/stream-enabled/*.conf; }
+${NGINX_END}
+EOF
 
     # HTTP → HTTPS redirect
-    cat > /etc/nginx/sites-available/80.conf <<EOF
+    cat > /etc/nginx/sites-available/3x-ui-pro-http.conf <<EOF
 server {
     listen 80;
-    server_name ${domain} ${reality_domain};
+    server_name ${domain};
     return 301 https://\$host\$request_uri;
 }
 EOF
@@ -432,7 +625,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass https://127.0.0.1:${sub_port};
+        proxy_pass http://127.0.0.1:${sub_port};
     }
     location = /${sub_path} {
         if (\$hack = 1) { return 404; }
@@ -440,7 +633,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass https://127.0.0.1:${sub_port};
+        proxy_pass http://127.0.0.1:${sub_port};
     }
     # Regex takes priority over prefix: catches subscription IDs (one-level deep)
     # and routes Clash/Mihomo clients to dynamic clash.yaml generator
@@ -451,10 +644,10 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass https://127.0.0.1:${sub_port};
+        proxy_pass http://127.0.0.1:${sub_port};
     }
-    location /assets  { proxy_pass https://127.0.0.1:${sub_port}; }
-    location /assets/ { proxy_pass https://127.0.0.1:${sub_port}; }
+    location /assets  { proxy_pass http://127.0.0.1:${sub_port}; }
+    location /assets/ { proxy_pass http://127.0.0.1:${sub_port}; }
 
     #Subscription (json)
     location /${json_path} {
@@ -463,7 +656,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass https://127.0.0.1:${sub_port};
+        proxy_pass http://127.0.0.1:${sub_port};
     }
     location /${json_path}/ {
         if (\$hack = 1) { return 404; }
@@ -471,7 +664,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass https://127.0.0.1:${sub_port};
+        proxy_pass http://127.0.0.1:${sub_port};
     }
 
     #XHTTP
@@ -527,7 +720,7 @@ EOF
     # snippet, which is included by BOTH vhosts, so they live in their own
     # always-loaded file — never inside a single vhost, or the other vhost's
     # include would reference an undefined var ("unknown ... variable").
-    cat > /etc/nginx/sites-available/00-maps.conf <<EOF
+    cat > /etc/nginx/sites-available/3x-ui-pro-maps.conf <<EOF
 # Detect Clash/Mihomo clients by User-Agent
 map \$http_user_agent \$is_clash_ua {
     ~*(clash|clashx|clashn|mihomo|stash|surfboard)  1;
@@ -543,6 +736,7 @@ EOF
 
     # Main domain vhost (TLS termination at 7443, proxy_protocol)
     cat > "/etc/nginx/sites-available/${domain}" <<EOF
+# Managed by 3x-ui-pro. Local edits may be replaced on reinstall.
 # Rate limiting zones (http context)
 limit_req_zone  \$binary_remote_addr zone=diag_api:10m  rate=6r/m;
 limit_req_zone  \$binary_remote_addr zone=diag_page:10m rate=30r/m;
@@ -561,7 +755,7 @@ server {
     listen [::]:7443 ssl${http2_listen} proxy_protocol;
     ${http2_on}
     index index.html index.htm index.php;
-    root /var/www/html/;
+    root /var/www/3x-ui-pro-cover/;
     real_ip_header proxy_protocol;
     set_real_ip_from 127.0.0.1;
     # This vhost listens on 7443 behind the SNI stream (public port 443). Without
@@ -739,63 +933,24 @@ server {
 }
 EOF
 
-    # Reality domain vhost (plain TLS at 9443, no proxy_protocol)
-    cat > "/etc/nginx/sites-available/${reality_domain}" <<EOF
-server {
-    server_tokens off;
-    server_name ${reality_domain};
-    listen 9443 ssl${http2_listen};
-    listen [::]:9443 ssl${http2_listen};
-    ${http2_on}
-    index index.html index.htm index.php;
-    root /var/www/html/;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!eNULL:!MD5:!DES:!RC4:!ADH:!SSLv3:!EXP:!PSK:!DSS;
-    ssl_certificate     /etc/letsencrypt/live/${reality_domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${reality_domain}/privkey.pem;
-    if (\$host !~* ^(.+\.)?${reality_domain}\$)            { return 444; }
-    if (\$scheme ~* https)                                  { set \$safe 1; }
-    if (\$ssl_server_name !~* ^(.+\.)?${reality_domain}\$) { set \$safe "\${safe}0"; }
-    if (\$safe = 10)                                        { return 444; }
-    if (\$request_uri ~ "(\"|'|\`|~|,|:|;|%|\\$|&&|\?\?|0x00|0X00|\||\\|\{|\}|\[|\]|<|>|\.\.\.|\.\.\/|\/\/\/)") { set \$hack 1; }
-    error_page 400 401 402 403 500 501 502 503 504 =404 /404;
-    proxy_intercept_errors on;
-
-    location /${panel_path}/ {
-        proxy_redirect off;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${panel_port};
-    }
-    location /${panel_path} {
-        proxy_redirect off;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:${panel_port};
-    }
-
-    include /etc/nginx/snippets/includes.conf;
-}
-EOF
-
     # Activate configs
     if [[ -f "/etc/nginx/sites-available/${domain}" ]]; then
         rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
-        ln -sf "/etc/nginx/sites-available/00-maps.conf"       /etc/nginx/sites-enabled/
+        rm -f /etc/nginx/sites-enabled/00-maps.conf /etc/nginx/sites-enabled/80.conf
+        ln -sf "/etc/nginx/sites-available/3x-ui-pro-maps.conf" /etc/nginx/sites-enabled/
         ln -sf "/etc/nginx/sites-available/${domain}"          /etc/nginx/sites-enabled/
-        ln -sf "/etc/nginx/sites-available/${reality_domain}"  /etc/nginx/sites-enabled/
-        ln -sf "/etc/nginx/sites-available/80.conf"            /etc/nginx/sites-enabled/
+        ln -sf "/etc/nginx/sites-available/3x-ui-pro-http.conf" /etc/nginx/sites-enabled/
     else
         msg_err "${domain} nginx config not found!" && exit 1
     fi
 
-    if [[ $(nginx -t 2>&1 | grep -o 'successful') != "successful" ]]; then
-        msg_err "nginx config check failed!" && exit 1
+    local nginx_test
+    if ! nginx_test=$(nginx -t 2>&1); then
+        printf '%s\n' "$nginx_test" >&2
+        die "nginx configuration check failed."
     fi
-
-    systemctl start nginx
+    systemctl restart nginx
+    systemctl is-active --quiet nginx || die "nginx did not become active."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -815,8 +970,17 @@ _arch() {
 }
 
 _panel_initial_config() {
-    /usr/local/x-ui/x-ui setting -username "asdfasdf" -password "asdfasdf" -port "2096" -webBasePath "asdfasdf"
-    /usr/local/x-ui/x-ui migrate
+    (
+        cd /usr/local/x-ui
+        ./x-ui setting -username "bootstrap" -password "$(gen_random_string 24)" \
+            -port "$panel_port" -webBasePath "bootstrap" -listenIP "127.0.0.1"
+        ./x-ui migrate
+    ) || die "Failed to initialize or migrate the 3x-ui database."
+}
+
+version_at_least() {
+    local current=${1#v} minimum=${2#v}
+    [[ "$(printf '%s\n%s\n' "$minimum" "$current" | sort -V | head -n1)" == "$minimum" ]]
 }
 
 resolve_latest_panel_tag() {
@@ -861,10 +1025,7 @@ verify_panel_archive() {
 }
 
 install_panel() {
-    local tag_version archive_url archive arch
-    apt-get update && apt-get install -y -q wget curl tar tzdata
-
-    cd /usr/local/ || exit 1
+    local tag_version archive_url archive arch stage service_file
     arch=$(_arch)
 
     if [[ -n "$PANEL_VERSION" ]]; then
@@ -875,9 +1036,14 @@ install_panel() {
         tag_version=$(resolve_latest_panel_tag) \
             || { msg_err "Failed to resolve latest stable 3x-ui version."; exit 1; }
     fi
+    version_at_least "$tag_version" "v3.5.0" \
+        || die "3x-ui ${tag_version} is too old; this installer requires v3.5.0 or newer."
+    PANEL_TAG="$tag_version"
 
     echo "Installing 3x-ui ${tag_version} ..."
-    archive="/usr/local/x-ui-linux-${arch}.tar.gz"
+    stage="${WORK_DIR}/panel"
+    mkdir -p "$stage/unpack"
+    archive="${stage}/x-ui-linux-${arch}.tar.gz"
     archive_url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-${arch}.tar.gz"
     curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 \
         --speed-limit 1 --speed-time 300 -o "$archive" "$archive_url" \
@@ -885,34 +1051,76 @@ install_panel() {
     [[ -s "$archive" ]] || { rm -f "$archive"; msg_err "Downloaded archive is empty."; exit 1; }
     verify_panel_archive "$archive_url" "$archive"
 
-    # Do not destroy a working installation until the replacement archive and
-    # all local assets have passed integrity checks.
-    clean_previous_install
-
-    tar zxvf "$archive"
-    rm -f "$archive"
-
-    cd x-ui || exit 1
-    [[ -s x-ui && -s x-ui.sh ]] \
-        || { msg_err "Release archive is missing x-ui or x-ui.sh."; exit 1; }
-    chmod +x x-ui x-ui.sh
+    if ! tar -tzf "$archive" | awk '
+        /^\// {bad=1}
+        { n=split($0,p,"/"); for(i=1;i<=n;i++) if(p[i]=="..") bad=1 }
+        END {exit bad}
+    '; then
+        die "Release archive contains an unsafe path."
+    fi
+    tar -xzf "$archive" -C "$stage/unpack" --no-same-owner --no-same-permissions
+    [[ -s "$stage/unpack/x-ui/x-ui" ]] \
+        || { msg_err "Release archive is missing the x-ui binary."; exit 1; }
+    [[ -d "$stage/unpack/x-ui/bin" ]] || die "Release archive is missing its bin directory."
 
     if [[ "$arch" == "armv5" || "$arch" == "armv6" || "$arch" == "armv7" ]]; then
-        mv "bin/xray-linux-${arch}" bin/xray-linux-arm32
-        chmod +x bin/xray-linux-arm32
+        [[ -s "$stage/unpack/x-ui/bin/xray-linux-${arch}" ]] || die "Release archive is missing Xray for ${arch}."
+        mv "$stage/unpack/x-ui/bin/xray-linux-${arch}" "$stage/unpack/x-ui/bin/xray-linux-arm32"
+        chmod +x "$stage/unpack/x-ui/bin/xray-linux-arm32"
     else
-        chmod +x "bin/xray-linux-${arch}"
+        [[ -s "$stage/unpack/x-ui/bin/xray-linux-${arch}" ]] || die "Release archive is missing Xray for ${arch}."
+        chmod +x "$stage/unpack/x-ui/bin/xray-linux-${arch}"
     fi
+    chmod +x "$stage/unpack/x-ui/x-ui"
 
-    # Install the CLI bundled in the checksum-verified release archive.
-    install -m 755 x-ui.sh /usr/bin/x-ui
+    # Everything above is non-destructive. Start a rollback transaction only
+    # after the release has passed checksum, path and structure validation.
+    ROLLBACK_DIR="${WORK_DIR}/rollback"
+    mkdir -p "$ROLLBACK_DIR"
+    [[ ! -d /etc/nginx ]] || cp -a /etc/nginx "$ROLLBACK_DIR/nginx"
+    [[ ! -d /var/www/diagnostics ]] || cp -a /var/www/diagnostics "$ROLLBACK_DIR/diagnostics"
+    [[ ! -d /var/www/subpage ]] || cp -a /var/www/subpage "$ROLLBACK_DIR/subpage"
+    [[ ! -d /var/www/3x-ui-pro-cover ]] || cp -a /var/www/3x-ui-pro-cover "$ROLLBACK_DIR/cover"
+    [[ ! -f /etc/systemd/system/x-ui.service ]] || cp -a /etc/systemd/system/x-ui.service "$ROLLBACK_DIR/x-ui.service"
+    [[ ! -f /etc/systemd/system/mtr-backend.service ]] || cp -a /etc/systemd/system/mtr-backend.service "$ROLLBACK_DIR/mtr-backend.service"
+    [[ ! -f /usr/bin/x-ui ]] || cp -a /usr/bin/x-ui "$ROLLBACK_DIR/x-ui-cli"
+    [[ ! -f "$SYSCTL_FILE" ]] || cp -a "$SYSCTL_FILE" "$ROLLBACK_DIR/sysctl.conf"
+    [[ ! -f /etc/cron.d/3x-ui-pro ]] || cp -a /etc/cron.d/3x-ui-pro "$ROLLBACK_DIR/certbot-cron"
+    [[ ! -f /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx ]] \
+        || cp -a /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx "$ROLLBACK_DIR/certbot-pre"
+    [[ ! -f /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services ]] \
+        || cp -a /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services "$ROLLBACK_DIR/certbot-post"
+    [[ ! -d "$STATE_DIR" ]] || cp -a "$STATE_DIR" "$ROLLBACK_DIR/state-dir"
+    [[ ! -d /usr/local/x-ui ]] || cp -a /usr/local/x-ui "$ROLLBACK_DIR/old-x-ui"
+    [[ ! -d /etc/x-ui ]] || cp -a /etc/x-ui "$ROLLBACK_DIR/old-etc-x-ui"
+    backup_existing_database
+    ROLLBACK_ACTIVE=1
+    systemctl stop x-ui 2>/dev/null || true
+    rm -rf /usr/local/x-ui /etc/x-ui
+    mv "$stage/unpack/x-ui" /usr/local/x-ui
+
+    # Prefer a release-bundled full CLI. Some releases omit it, so keep a
+    # local integrity-checked management wrapper as a network-free fallback.
+    if [[ -s /usr/local/x-ui/x-ui.sh ]]; then
+        install -m 755 /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
+    else
+        install -m 755 "${ASSET_DIR}/x-ui-wrapper.sh" /usr/bin/x-ui
+    fi
 
     _panel_initial_config
 
-    cp -f x-ui.service.debian /etc/systemd/system/x-ui.service
+    if [[ -s /usr/local/x-ui/x-ui.service ]]; then
+        service_file=/usr/local/x-ui/x-ui.service
+    elif [[ -s /usr/local/x-ui/x-ui.service.debian ]]; then
+        service_file=/usr/local/x-ui/x-ui.service.debian
+    else
+        service_file="${ASSET_DIR}/systemd/x-ui.service"
+    fi
+    install -m 644 "$service_file" /etc/systemd/system/x-ui.service
     systemctl daemon-reload
     systemctl enable x-ui
-    systemctl start x-ui
+    systemctl restart x-ui
+    systemctl is-active --quiet x-ui || die "x-ui did not become active after installation."
 
     msg_ok "3x-ui ${tag_version} installed."
 }
@@ -921,19 +1129,31 @@ install_panel() {
 # CONFIGURE X-UI DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
 configure_xui_db() {
-    if [[ ! -f $XUIDB ]]; then
-        msg_err "x-ui.db not found — panel may not be installed." && exit 1
-    fi
+    [[ -s "$XUIDB" ]] || die "x-ui.db not found — panel may not be installed."
+    sqlite3 "$XUIDB" 'PRAGMA quick_check;' | grep -Fxq ok \
+        || die "x-ui database integrity check failed."
+    sqlite3 "$XUIDB" "SELECT 1 FROM settings LIMIT 1; SELECT 1 FROM inbounds LIMIT 1; SELECT 1 FROM hosts LIMIT 1;" >/dev/null \
+        || die "Installed 3x-ui database schema is incompatible."
 
     x-ui stop 2>/dev/null || true
+    local stop_attempt
+    for stop_attempt in {1..10}; do
+        : "$stop_attempt"
+        port_in_use 8443 || break
+        sleep 1
+    done
+    port_in_use 8443 && die "TCP port 8443 is still occupied after stopping the previous Xray instance."
 
     local output private_key public_key emoji_flag xray_bin
     # install_panel follows the upstream arm32 binary naming convention.
     xray_bin="/usr/local/x-ui/bin/xray-linux-$(_arch)"
     [[ -f "$xray_bin" ]] || xray_bin="/usr/local/x-ui/bin/xray-linux-arm32"
-    output=$("$xray_bin" x25519)
-    private_key=$(echo "$output" | grep "^PrivateKey:" | awk '{print $2}')
-    public_key=$(echo "$output"  | grep "^Password"   | awk '{print $3}')
+    [[ -x "$xray_bin" ]] || die "Xray executable is missing for $(_arch)."
+    output=$("$xray_bin" x25519) || die "Xray failed to generate a REALITY key pair."
+    private_key=$(awk '/^PrivateKey:/ {print $2; exit}' <<< "$output")
+    public_key=$(awk '/^Password \(PublicKey\):/ {print $3; exit}' <<< "$output")
+    [[ "$private_key" =~ ^[A-Za-z0-9_-]{40,60}$ && "$public_key" =~ ^[A-Za-z0-9_-]{40,60}$ ]] \
+        || die "Unexpected Xray x25519 output; refusing to write empty/invalid keys."
     # Per-host group_id: without it the panel cannot edit or delete the host.
     # The column only exists since 3x-ui v3.5.0 (pinnable via -version), so
     # probe the migrated schema and skip it on older releases.
@@ -965,14 +1185,16 @@ BEGIN IMMEDIATE;
 DELETE FROM "settings" WHERE "key" IN ("webCertFile","webKeyFile");
 
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subPort",             '${sub_port}');
-UPDATE "settings" SET "value" = '/${sub_path}/' WHERE "key" = 'subPath';
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subListen",           '127.0.0.1');
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subPath",             '/${sub_path}/');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subURI",              '${sub_uri}');
-UPDATE "settings" SET "value" = '/${json_path}/' WHERE "key" = 'subJsonPath';
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonEnable",       'true');
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonPath",         '/${json_path}/');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonURI",          '${json_uri}');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subClashEnable",      'false');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subEnableRouting",    'false');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subEnable",           'true');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("webListen",           '');
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("webListen",           '127.0.0.1');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("webDomain",           '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("webCertFile",         '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("webKeyFile",          '');
@@ -980,7 +1202,6 @@ INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("sessionMaxAge",      
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("pageSize",            '50');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("expireDiff",          '0');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("trafficDiff",         '0');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("remarkModel",         '-ieo');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotEnable",         'false');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotToken",          '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotProxy",          '');
@@ -988,19 +1209,14 @@ INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotAPIServer",     
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotChatId",         '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgRunTime",           '@daily');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotBackup",         'false');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgBotLoginNotify",    'true');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgCpu",               '80');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("tgLang",              'en-US');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("timeLocation",        'Europe/Moscow');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("secretEnable",        'false');
+INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("timeLocation",        'Local');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subDomain",           '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subCertFile",         '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subKeyFile",          '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subUpdates",          '12');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subEncrypt",          'true');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subShowInfo",         'true');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonFragment",     '');
-INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonNoises",       '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonMux",          '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("subJsonRules",        '');
 INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("datepicker",          'gregorian');
@@ -1008,7 +1224,7 @@ INSERT OR REPLACE INTO "settings" ("key","value") VALUES ("datepicker",         
 INSERT INTO "inbounds"
     ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
 VALUES (
-    '1','0','0','0','${emoji_flag} reality','1','0','','8443','vless',
+    '1','0','0','0','${emoji_flag} reality','1','0','127.0.0.1','8443','vless',
     '{
   "clients": [],
   "decryption": "none",
@@ -1020,7 +1236,7 @@ VALUES (
   "realitySettings": {
     "show": false,
     "xver": 0,
-    "target": "127.0.0.1:9443",
+    "target": "${reality_domain}:443",
     "serverNames": ["${reality_domain}"],
     "privateKey": "${private_key}",
     "minClient": "",
@@ -1049,7 +1265,7 @@ VALUES (
 INSERT INTO "inbounds"
     ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
 VALUES (
-    '1','0','0','0','${emoji_flag} ws','1','0','','${ws_port}','vless',
+    '1','0','0','0','${emoji_flag} ws','1','0','127.0.0.1','${ws_port}','vless',
     '{
   "clients": [],
   "decryption": "none",
@@ -1117,7 +1333,7 @@ VALUES (
 INSERT INTO "inbounds"
     ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing")
 VALUES (
-    '1','0','0','0','${emoji_flag} trojan-grpc','1','0','','${trojan_port}','trojan',
+    '1','0','0','0','${emoji_flag} trojan-grpc','1','0','127.0.0.1','${trojan_port}','trojan',
     '{
   "clients": [],
   "fallbacks": []
@@ -1156,13 +1372,17 @@ EOF
         -username  "${config_username}" \
         -password  "${config_password}" \
         -port      "${panel_port}"      \
-        -webBasePath "${panel_path}"
+        -webBasePath "${panel_path}" \
+        -listenIP "127.0.0.1" \
+        || die "Failed to apply panel credentials and path."
 
     /usr/local/x-ui/x-ui cert \
         -webCert    "/root/cert/${domain}/fullchain.pem" \
-        -webCertKey "/root/cert/${domain}/privkey.pem"
+        -webCertKey "/root/cert/${domain}/privkey.pem" \
+        || die "Failed to apply the panel certificate."
 
-    x-ui start
+    x-ui restart
+    systemctl is-active --quiet x-ui || die "x-ui failed after database configuration."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1185,10 +1405,10 @@ install_clash_sub() {
 }
 
 install_fake_site() {
-    mkdir -p /var/www/html
-    if install -m 644 "${ASSET_DIR}/fake-site/index.html" /var/www/html/index.html; then
-        chown -R www-data:www-data /var/www/html 2>/dev/null || true
-        chmod 644 /var/www/html/index.html
+    mkdir -p /var/www/3x-ui-pro-cover
+    if install -m 644 "${ASSET_DIR}/fake-site/index.html" /var/www/3x-ui-pro-cover/index.html; then
+        chown -R www-data:www-data /var/www/3x-ui-pro-cover 2>/dev/null || true
+        chmod 644 /var/www/3x-ui-pro-cover/index.html
         msg_ok "Local cover site installed."
     else
         msg_err "Failed to install local cover site."
@@ -1222,10 +1442,12 @@ install_diagnostics() {
     # Test download files
     local testfiles="${diag_webroot}/testfiles"
     mkdir -p "${testfiles}"
-    [[ -f "${testfiles}/test-15k.bin"  ]] || dd if=/dev/zero bs=1024    count=15   of="${testfiles}/test-15k.bin"  status=none
-    [[ -f "${testfiles}/test-17k.bin"  ]] || dd if=/dev/zero bs=1024    count=17   of="${testfiles}/test-17k.bin"  status=none
-    [[ -f "${testfiles}/test-100m.bin" ]] || dd if=/dev/zero bs=1048576 count=100  of="${testfiles}/test-100m.bin" status=none
-    [[ -f "${testfiles}/test-1g.bin"   ]] || dd if=/dev/zero bs=1048576 count=1024 of="${testfiles}/test-1g.bin"   status=none
+    # Sparse files produce the same zero-filled network payload without
+    # consuming ~1.1 GiB of physical disk space on a small VPS.
+    truncate -s 15K  "${testfiles}/test-15k.bin"
+    truncate -s 17K  "${testfiles}/test-17k.bin"
+    truncate -s 100M "${testfiles}/test-100m.bin"
+    truncate -s 1G   "${testfiles}/test-1g.bin"
     rm -f "${testfiles}/test-512m.bin"   # only used by the old single-stream speed test
     chown -R www-data:www-data "${diag_webroot}" 2>/dev/null || true
 
@@ -1286,6 +1508,18 @@ EOF
     systemctl daemon-reload
     systemctl enable mtr-backend
     systemctl restart mtr-backend
+    systemctl is-active --quiet mtr-backend || die "mtr-backend did not become active."
+    local health_ok=0 attempt
+    for attempt in {1..10}; do
+        if curl -fsS --connect-timeout 2 --max-time 3 \
+            --noproxy '*' \
+            "http://127.0.0.1:${mtr_backend_port}/health" >/dev/null; then
+            health_ok=1
+            break
+        fi
+        sleep 1
+    done
+    ((health_ok == 1)) || die "mtr-backend health check failed."
 
     msg_ok "Network diagnostics installed at https://${domain}/${panel_path}/diag (panel login required)"
 }
@@ -1294,9 +1528,7 @@ EOF
 # SYSTEM TUNING (BBR + kernel params)
 # ─────────────────────────────────────────────────────────────────────────────
 tune_system() {
-    local params=(
-        "net.core.default_qdisc=fq"
-        "net.ipv4.tcp_congestion_control=bbr"
+    local -a params=(
         "fs.file-max=2097152"
         "net.ipv4.tcp_timestamps=1"
         "net.ipv4.tcp_sack=1"
@@ -1306,89 +1538,267 @@ tune_system() {
         "net.ipv4.tcp_rmem=4096 87380 16777216"
         "net.ipv4.tcp_wmem=4096 65536 16777216"
     )
-    for p in "${params[@]}"; do
-        grep -qxF "$p" /etc/sysctl.conf || echo "$p" >> /etc/sysctl.conf
-    done
-    sysctl -p
+    if modprobe tcp_bbr 2>/dev/null \
+       && sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        params=("net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr" "${params[@]}")
+    else
+        msg_inf "Warning: this kernel does not expose BBR; applying the remaining safe TCP parameters."
+    fi
+    {
+        echo "# Managed by 3x-ui-pro. Remove this file to revert these tunables."
+        printf '%s\n' "${params[@]}"
+    } > "$SYSCTL_FILE"
+    if ! sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
+        rm -f "$SYSCTL_FILE"
+        msg_inf "Warning: kernel tuning is not permitted on this host; skipped without affecting the installation."
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CRON JOBS
 # ─────────────────────────────────────────────────────────────────────────────
 setup_cron() {
-    # A dedicated file is idempotent and never rewrites the administrator's
-    # root crontab. Certbot decides whether a certificate is due for renewal.
-    cat > /etc/cron.d/3x-ui-pro <<'EOF'
-SHELL=/bin/sh
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-15 3,15 * * * root certbot renew --quiet --non-interactive --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx"
+    # Use Certbot's distro-managed timer/cron and install idempotent hooks.
+    # The post hook always brings nginx back even when a renewal attempt fails.
+    install -d -m 755 /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
+    cat > /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx <<'EOF'
+#!/bin/sh
+systemctl stop nginx
 EOF
-    chmod 644 /etc/cron.d/3x-ui-pro
+    cat > /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services <<'EOF'
+#!/bin/sh
+systemctl start nginx
+systemctl try-restart x-ui >/dev/null 2>&1 || true
+EOF
+    chmod 755 /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx \
+              /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services
+    rm -f /etc/cron.d/3x-ui-pro
+    systemctl enable --now certbot.timer 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FIREWALL
 # ─────────────────────────────────────────────────────────────────────────────
 setup_firewall() {
-    local ssh_port="22"
-    if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        ssh_port=${SSH_CONNECTION##* }
+    [[ "${SKIP_FIREWALL:-0}" != "1" ]] || {
+        msg_inf "Firewall setup skipped because SKIP_FIREWALL=1."
+        return 0
+    }
+    local -a ssh_ports=()
+    local port sshd_bin=""
+    if [[ -n "$SSH_PORT" ]]; then
+        ssh_ports+=("$SSH_PORT")
+    elif [[ -n "${SSH_CONNECTION:-}" ]]; then
+        ssh_ports+=("${SSH_CONNECTION##* }")
+    else
+        sshd_bin=$(command -v sshd || true)
+        [[ -n "$sshd_bin" ]] || [[ ! -x /usr/sbin/sshd ]] || sshd_bin=/usr/sbin/sshd
+        if [[ -n "$sshd_bin" ]]; then
+            while read -r _ port; do
+                [[ "$port" =~ ^[0-9]+$ ]] && ssh_ports+=("$port")
+            done < <("$sshd_bin" -T 2>/dev/null | awk '$1=="port" {print $1, $2}' || true)
+        fi
     fi
-    [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=22
-    ufw allow "${ssh_port}/tcp"
+
+    if ((${#ssh_ports[@]} == 0)); then
+        if ufw status 2>/dev/null | grep -q '^Status: active'; then
+            die "UFW is active but the SSH port could not be detected. Set SSH_PORT explicitly."
+        fi
+        msg_inf "Warning: SSH port was not detectable; UFW was not enabled. Set SSH_PORT and rerun to enable it safely."
+        return 0
+    fi
+    for port in "${ssh_ports[@]}"; do
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+            die "Invalid SSH port: $port"
+        fi
+        ufw allow "${port}/tcp"
+    done
     ufw allow 80/tcp
     ufw allow 443/tcp
-    ufw allow 443/udp
     ufw --force enable
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHOW RESULTS
 # ─────────────────────────────────────────────────────────────────────────────
-show_results() {
-    clear
-    if systemctl is-active --quiet x-ui; then
-        printf '0\n' | x-ui | grep --color=never -i ':'
-        msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/\n"
-        echo -e "Username:  ${config_username}\n"
-        echo -e "Password:  ${config_password}\n"
-        msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "Network Diagnostics (panel login required): https://${domain}/${panel_path}/diag\n"
-        msg_inf "────────────────────────────────────────────────────────────────────────────────"
-        msg_inf "Please save this screen!"
+rollback_install() {
+    ((ROLLBACK_ACTIVE == 1)) || return 0
+    msg_inf "Installation failed; restoring the previous installation..."
+    systemctl stop x-ui mtr-backend nginx 2>/dev/null || true
+
+    rm -rf /usr/local/x-ui /etc/x-ui
+    [[ ! -d "$ROLLBACK_DIR/old-x-ui" ]] || mv "$ROLLBACK_DIR/old-x-ui" /usr/local/x-ui
+    [[ ! -d "$ROLLBACK_DIR/old-etc-x-ui" ]] || mv "$ROLLBACK_DIR/old-etc-x-ui" /etc/x-ui
+
+    if [[ -f "$ROLLBACK_DIR/x-ui.service" ]]; then
+        cp -a "$ROLLBACK_DIR/x-ui.service" /etc/systemd/system/x-ui.service
     else
-        nginx -t
-        printf '0\n' | x-ui | grep --color=never -i ':'
-        msg_err "x-ui or nginx check failed. Try on a clean Linux install."
+        rm -f /etc/systemd/system/x-ui.service
     fi
+    if [[ -f "$ROLLBACK_DIR/mtr-backend.service" ]]; then
+        cp -a "$ROLLBACK_DIR/mtr-backend.service" /etc/systemd/system/mtr-backend.service
+    else
+        rm -f /etc/systemd/system/mtr-backend.service
+    fi
+    if [[ -f "$ROLLBACK_DIR/x-ui-cli" ]]; then
+        cp -a "$ROLLBACK_DIR/x-ui-cli" /usr/bin/x-ui
+    else
+        rm -f /usr/bin/x-ui
+    fi
+    if [[ -d "$ROLLBACK_DIR/nginx" ]]; then
+        rm -f "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}" \
+              /etc/nginx/sites-available/3x-ui-pro-maps.conf \
+              /etc/nginx/sites-available/3x-ui-pro-http.conf \
+              /etc/nginx/sites-enabled/3x-ui-pro-maps.conf \
+              /etc/nginx/sites-enabled/3x-ui-pro-http.conf \
+              /etc/nginx/stream-enabled/stream.conf \
+              /etc/nginx/snippets/includes.conf
+        cp -a "$ROLLBACK_DIR/nginx/." /etc/nginx/
+    fi
+
+    rm -rf /var/www/diagnostics /var/www/subpage /var/www/3x-ui-pro-cover "$STATE_DIR"
+    [[ ! -d "$ROLLBACK_DIR/diagnostics" ]] || cp -a "$ROLLBACK_DIR/diagnostics" /var/www/diagnostics
+    [[ ! -d "$ROLLBACK_DIR/subpage" ]] || cp -a "$ROLLBACK_DIR/subpage" /var/www/subpage
+    [[ ! -d "$ROLLBACK_DIR/cover" ]] || cp -a "$ROLLBACK_DIR/cover" /var/www/3x-ui-pro-cover
+    [[ ! -d "$ROLLBACK_DIR/state-dir" ]] || cp -a "$ROLLBACK_DIR/state-dir" "$STATE_DIR"
+    if [[ -f "$ROLLBACK_DIR/sysctl.conf" ]]; then
+        cp -a "$ROLLBACK_DIR/sysctl.conf" "$SYSCTL_FILE"
+    else
+        rm -f "$SYSCTL_FILE"
+    fi
+    rm -f /etc/cron.d/3x-ui-pro \
+          /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx \
+          /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services
+    [[ ! -f "$ROLLBACK_DIR/certbot-cron" ]] || cp -a "$ROLLBACK_DIR/certbot-cron" /etc/cron.d/3x-ui-pro
+    [[ ! -f "$ROLLBACK_DIR/certbot-pre" ]] || cp -a "$ROLLBACK_DIR/certbot-pre" /etc/letsencrypt/renewal-hooks/pre/3x-ui-pro-stop-nginx
+    [[ ! -f "$ROLLBACK_DIR/certbot-post" ]] || cp -a "$ROLLBACK_DIR/certbot-post" /etc/letsencrypt/renewal-hooks/post/3x-ui-pro-restart-services
+
+    systemctl daemon-reload 2>/dev/null || true
+    [[ ! -d /usr/local/x-ui ]] || systemctl enable --now x-ui 2>/dev/null || true
+    [[ ! -f /etc/systemd/system/mtr-backend.service ]] || systemctl enable --now mtr-backend 2>/dev/null || true
+    nginx -t >/dev/null 2>&1 && systemctl restart nginx 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
+    ROLLBACK_ACTIVE=0
+}
+
+on_exit() {
+    local status="$1"
+    trap - EXIT
+    set +e
+    if ((status != 0)); then
+        [[ -z "$LAST_ERROR" ]] || msg_err "Failure context: $LAST_ERROR"
+        ((NGINX_STOPPED_BY_US == 0)) || systemctl start nginx 2>/dev/null || true
+        rollback_install
+    fi
+    [[ -z "$WORK_DIR" || ! -d "$WORK_DIR" ]] || rm -rf "$WORK_DIR"
+    exit "$status"
+}
+
+commit_install() {
+    ROLLBACK_ACTIVE=0
+    [[ -z "$ROLLBACK_DIR" || ! -d "$ROLLBACK_DIR" ]] || rm -rf "$ROLLBACK_DIR"
+}
+
+preflight_fixed_ports() {
+    local existing_state=0 port
+    [[ -r "$STATE_FILE" ]] && existing_state=1
+    for port in 7443 8443; do
+        if port_in_use "$port" && ((existing_state == 0)); then
+            die "Required local port $port is already in use on a fresh installation."
+        fi
+    done
+}
+
+persist_install_state() {
+    install -d -m 700 "$STATE_DIR"
+    local tmp="${STATE_FILE}.tmp"
+    {
+        printf 'DOMAIN=%s\n' "$domain"
+        printf 'REALITY_TARGET=%s\n' "$reality_domain"
+        printf 'PANEL_VERSION=%s\n' "$PANEL_TAG"
+        printf 'PANEL_USERNAME=%s\n' "$config_username"
+        printf 'PANEL_PASSWORD=%s\n' "$config_password"
+        printf 'PANEL_PATH=%s\n' "$panel_path"
+        printf 'PANEL_PORT=%s\n' "$panel_port"
+        printf 'SUB_PATH=%s\n' "$sub_path"
+        printf 'JSON_PATH=%s\n' "$json_path"
+        printf 'DIAG_PATH=%s\n' "$diag_path"
+    } > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
+health_check() {
+    local -a services=(x-ui nginx mtr-backend)
+    local -a ports=(443 7443 8443 "$panel_port" "$sub_port" "$ws_port" "$trojan_port" "$mtr_backend_port")
+    local service port attempt http_code sub_code
+    nginx -t
+    for service in "${services[@]}"; do
+        systemctl is-active --quiet "$service" || die "Health check failed: $service is not active."
+    done
+    for port in "${ports[@]}"; do
+        for attempt in {1..20}; do
+            : "$attempt"
+            port_in_use "$port" && break
+            sleep 1
+        done
+        port_in_use "$port" || die "Health check failed: TCP port $port is not listening."
+    done
+    http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        --noproxy '*' --connect-timeout 5 --max-time 15 \
+        --resolve "${domain}:443:127.0.0.1" "https://${domain}/${panel_path}/") \
+        || die "Health check failed: panel HTTPS request could not be completed."
+    [[ "$http_code" =~ ^(200|301|302|303|307|308|401|403)$ ]] \
+        || die "Health check failed: panel returned HTTP $http_code."
+    sub_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+        --noproxy '*' --connect-timeout 3 --max-time 10 "http://127.0.0.1:${sub_port}/${sub_path}/") \
+        || die "Health check failed: subscription server is unreachable."
+    [[ "$sub_code" != "000" && "$sub_code" != 5* ]] \
+        || die "Health check failed: subscription server returned HTTP $sub_code."
+}
+
+show_results() {
+    msg_inf "────────────────────────────────────────────────────────────────────────────────"
+    msg_inf "X-UI Secure Panel: https://${domain}/${panel_path}/\n"
+    msg_inf "REALITY camouflage target: ${reality_domain}:443\n"
+    printf 'Username:  %s\nPassword:  %s\n\n' "$config_username" "$config_password"
+    msg_inf "Network Diagnostics: https://${domain}/${panel_path}/diag\n"
+    msg_inf "Credentials/state (root only): ${STATE_FILE}\n"
+    msg_inf "────────────────────────────────────────────────────────────────────────────────"
+    msg_ok "Installation completed and all health checks passed."
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 main() {
+    WORK_DIR=$(mktemp -d /tmp/3x-ui-pro.XXXXXX)
+    trap 'LAST_ERROR="line ${LINENO}: ${BASH_COMMAND}"' ERR
+    trap 'on_exit $?' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+
     validate_domains
     verify_local_assets
     install_packages
     get_server_ip
-    install_panel
+    validate_reality_target
+    generate_install_values
+    preflight_fixed_ports
     get_ssl_certs
-
-    configure_nginx
+    install_panel
     configure_xui_db
     install_clash_sub
     install_fake_site
     install_diagnostics
     tune_system
     setup_cron
+    configure_nginx
     setup_firewall
-
-    if ! systemctl is-enabled --quiet x-ui; then
-        systemctl daemon-reload && systemctl enable x-ui.service
-    fi
-    x-ui restart
-
+    systemctl restart x-ui
+    health_check
+    persist_install_state
+    commit_install
     show_results
 }
 

@@ -1,14 +1,14 @@
 # Security review
 
-Review date: 2026-09-30.
+Review date: 2026-10-03.
 
 Audited inputs:
 
 - local `start-script.sh`;
 - `mozaroc/3x-ui-pro` assets at commit
   `a2c430cd6dec7c86d873dcda3544a61e7ac41144`;
-- official `MHSanaei/3x-ui` installer at commit
-  `99047c0a6394af4f74a3105220f2910ef615dce8`.
+- official `MHSanaei/3x-ui` installer and subscription server at commit
+  `0054e671f88362696a0cb791e0ae7e4f18f7ed75`.
 
 ## Conclusion
 
@@ -57,9 +57,9 @@ pinning with `-version` remains recommended.
 
 ### Medium: root-level configuration injection — fixed
 
-Panel and REALITY domains previously flowed into nginx and SQLite templates
-without strict validation. Both must now be lowercase-valid FQDNs before any
-destructive installation step.
+The panel domain and REALITY camouflage target previously flowed into nginx and
+SQLite templates without strict validation. Both must now be lowercase-valid
+FQDNs before any destructive installation step.
 
 ### Medium: unrelated service and cron modification — fixed
 
@@ -72,6 +72,41 @@ during package installation, rewrites root's crontab, or assumes SSH uses port
 Settings use idempotent upserts, and the generated inbounds/hosts are applied in
 one SQLite transaction with `.bail on`; a schema error rolls back instead of
 leaving a half-configured panel.
+
+### Critical: unsafe CLI parsing and uninstall paths — fixed
+
+Every value-taking option now requires a value, unknown options are rejected,
+and booleans are parsed exactly. Domains are validated before they may enter a
+filesystem path. Uninstall reads a root-only state manifest and refuses a
+conflicting domain instead of accepting path traversal input.
+
+### High: partial replacement and ignored failures — fixed
+
+The installer now uses strict Bash error handling, validates the archive paths
+and required binaries in a staging directory, and keeps rollback copies until
+nginx, x-ui, Xray listeners, the subscription server, diagnostics backend, and
+panel HTTPS have passed health checks. A failure restores the prior panel and
+managed configuration.
+
+### High: SSH lockout and exposed internal listeners — fixed
+
+UFW is not newly enabled unless an SSH port is explicitly supplied, inherited
+from the current SSH connection, or obtained from `sshd -T`. Internal panel,
+subscription, diagnostics, and Xray proxy targets bind to loopback rather than
+relying on firewall rules for isolation.
+
+### High: broken subscription upstream protocol — fixed
+
+3x-ui serves subscriptions over plain HTTP when `subCertFile` and `subKeyFile`
+are empty. The nginx upstream now uses HTTP, while public TLS still terminates
+at nginx. JSON subscriptions are explicitly enabled with `subJsonEnable=true`.
+
+### Medium: global system mutation and resource exhaustion — fixed
+
+Nginx changes use a removable marker block, sysctl settings live in a dedicated
+file, Certbot uses renewal hooks instead of a duplicate scheduled job, and
+speed-test downloads are sparse files. The diagnostics backend validates body
+lengths, bounds concurrent MTR processes, and prunes stale rate-limit entries.
 
 ## Remaining trust and network dependencies
 
@@ -90,9 +125,8 @@ leaving a half-configured panel.
 1. Replace external Clash rule providers with locally mirrored, digest-pinned
    rule sets if fully offline client policy is required.
 2. Add a non-destructive upgrade mode that preserves the database and generated
-   secrets rather than treating every install as a rebuild.
-3. Persist an installer-owned state manifest so uninstall can remove vhost files
-   even when domains are not supplied again.
-4. Run an integration test on disposable Debian and Ubuntu VMs before production;
+   secrets rather than treating every install as a rebuild. The current rebuild
+   mode keeps a timestamped database backup and performs automatic rollback.
+3. Run an integration test on disposable Debian and Ubuntu VMs before production;
    static checks cannot validate systemd, nginx modules, ACME, or the live 3x-ui
    database schema.

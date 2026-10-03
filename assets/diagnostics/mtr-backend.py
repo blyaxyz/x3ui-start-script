@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from urllib.parse import parse_qs, urlparse
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -27,6 +27,7 @@ MTR_TIMEOUT = 360        # seconds: mtr max run time (100 packets × ~3s margin)
 RATE_LIMIT_WINDOW = 60   # seconds
 RATE_LIMIT_MAX = 3       # requests per window per IP
 MTR_BIN = "/usr/bin/mtr"
+MAX_CONCURRENT_MTR = 4
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,12 +39,22 @@ log = logging.getLogger("mtr-backend")
 # ── Rate limiter ───────────────────────────────────────────────────────────────
 _rate_lock = Lock()
 _rate_store: dict[str, list[float]] = {}
+_mtr_slots = BoundedSemaphore(MAX_CONCURRENT_MTR)
 
 
 def rate_check(client_ip: str) -> bool:
     """Returns True if request is allowed, False if rate-limited."""
     now = time.monotonic()
     with _rate_lock:
+        # Bound memory even if many one-off source addresses hit the service.
+        if len(_rate_store) > 4096:
+            stale = [ip for ip, seen in _rate_store.items()
+                     if not seen or now - seen[-1] >= RATE_LIMIT_WINDOW]
+            for ip in stale:
+                _rate_store.pop(ip, None)
+        if client_ip not in _rate_store and len(_rate_store) >= 4096:
+            # dicts preserve insertion order on supported Python versions.
+            _rate_store.pop(next(iter(_rate_store)), None)
         times = _rate_store.get(client_ip, [])
         times = [t for t in times if now - t < RATE_LIMIT_WINDOW]
         if len(times) >= RATE_LIMIT_MAX:
@@ -120,6 +131,8 @@ def run_mtr(target_ip: str, count: int) -> dict:
         target_ip,
     ]
 
+    if not _mtr_slots.acquire(blocking=False):
+        return {"success": False, "error": "server busy; try again shortly", "output": ""}
     log.info("Running mtr: %s cycles → %s", count, target_ip)
     try:
         result = subprocess.run(
@@ -143,6 +156,8 @@ def run_mtr(target_ip: str, count: int) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.error("mtr exception: %s", exc)
         return {"success": False, "error": "internal error", "output": ""}
+    finally:
+        _mtr_slots.release()
 
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
@@ -190,8 +205,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _discard_body(self, max_bytes: int) -> int:
         """Read and discard the request body as fast as possible. Returns bytes read."""
-        content_length = int(self.headers.get("Content-Length", "0"))
-        to_read = min(content_length, max_bytes)
+        raw_length = self.headers.get("Content-Length", "0").strip()
+        if not re.fullmatch(r"[0-9]{1,10}", raw_length):
+            raise ValueError("invalid Content-Length")
+        content_length = int(raw_length)
+        if content_length > max_bytes:
+            raise ValueError("request body too large")
+        to_read = content_length
         received = 0
         buf = 1024 * 1024
         while received < to_read:
@@ -246,13 +266,21 @@ class Handler(BaseHTTPRequestHandler):
         # ── LibreSpeed upload sink: discard body, empty 200 ────────────────
         # Client measures via XHR upload progress; server just consumes bytes.
         if parsed.path == "/api/st/up" or parsed.path.endswith("/api/st/up"):
-            self._discard_body(64 * 1024 * 1024)  # librespeed blobs are ~20 MB
+            try:
+                self._discard_body(64 * 1024 * 1024)  # librespeed blobs are ~20 MB
+            except ValueError as exc:
+                self._send_json(413, {"error": str(exc)})
+                return
             self._send_text(200, "")
             return
 
         # ── Legacy upload speed test receiver ──────────────────────────────
         if parsed.path == "/api/upload" or parsed.path.endswith("/api/upload"):
-            received = self._discard_body(600 * 1024 * 1024)
+            try:
+                received = self._discard_body(600 * 1024 * 1024)
+            except ValueError as exc:
+                self._send_json(413, {"error": str(exc)})
+                return
             self._send_json(200, {"received": received, "ok": True})
             return
 
