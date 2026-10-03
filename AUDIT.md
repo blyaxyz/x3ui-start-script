@@ -107,6 +107,10 @@ Nginx changes use a removable marker block, sysctl settings live in a dedicated
 file, Certbot uses renewal hooks instead of a duplicate scheduled job, and
 speed-test downloads are sparse files. The diagnostics backend validates body
 lengths, bounds concurrent MTR processes, and prunes stale rate-limit entries.
+Its executable and shared read-only web assets now use explicit `0755`
+directory permissions instead of inheriting the installer's root-only umask;
+the dedicated service account and group are created independently and verified
+by an `ExecStartPre` readability check.
 
 ## Remaining trust and network dependencies
 

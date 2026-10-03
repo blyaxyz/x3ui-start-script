@@ -6,6 +6,8 @@ Client IP is taken from X-Real-IP header (set by nginx).
 Never runs mtr to arbitrary hosts.
 """
 
+from __future__ import annotations
+
 import argparse
 import ipaddress
 import json

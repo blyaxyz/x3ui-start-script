@@ -480,7 +480,8 @@ validate_reality_target() {
 # ─────────────────────────────────────────────────────────────────────────────
 install_packages() {
     local -a packages=(curl wget jq bash sudo certbot sqlite3 ufw mtr-tiny
-        python3 libcap2-bin openssl ca-certificates iproute2 tar coreutils cron kmod)
+        python3 libcap2-bin openssl ca-certificates iproute2 tar coreutils
+        findutils passwd cron kmod)
     if [[ "$INSTALL" == "yes" ]]; then
         msg_inf "Refreshing OS package metadata..."
         DEBIAN_FRONTEND=noninteractive apt-get update
@@ -499,7 +500,8 @@ install_packages() {
     fi
 
     local cmd
-    for cmd in curl wget jq nginx certbot sqlite3 ufw mtr python3 openssl ss tar systemctl; do
+    for cmd in curl wget jq nginx certbot sqlite3 ufw mtr python3 openssl ss tar \
+        systemctl useradd groupadd; do
         command -v "$cmd" >/dev/null 2>&1 || die "Required command is missing: $cmd (use -install yes)."
     done
     systemctl daemon-reload
@@ -1390,12 +1392,13 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 install_clash_sub() {
     local clash_dir="/var/www/subpage"
-    mkdir -p "${clash_dir}"
+    install -d -o root -g root -m 755 "${clash_dir}"
     if install -m 644 "${ASSET_DIR}/clash/clash.yaml" "${clash_dir}/clash.yaml.tpl"; then
         # Substitute deployment values; SUB_ID is filled per request.
         sed -i "s|\${DOMAIN}|${domain}|g"     "${clash_dir}/clash.yaml.tpl"
         sed -i "s|\${SUB_PATH}|${sub_path}|g" "${clash_dir}/clash.yaml.tpl"
-        chown -R www-data:www-data "${clash_dir}" 2>/dev/null || true
+        chown root:root "${clash_dir}" "${clash_dir}/clash.yaml.tpl"
+        chmod 755 "${clash_dir}"
         chmod 644 "${clash_dir}/clash.yaml.tpl"
         msg_ok "Clash subscription template installed."
     else
@@ -1405,9 +1408,9 @@ install_clash_sub() {
 }
 
 install_fake_site() {
-    mkdir -p /var/www/3x-ui-pro-cover
+    install -d -o root -g root -m 755 /var/www/3x-ui-pro-cover
     if install -m 644 "${ASSET_DIR}/fake-site/index.html" /var/www/3x-ui-pro-cover/index.html; then
-        chown -R www-data:www-data /var/www/3x-ui-pro-cover 2>/dev/null || true
+        chown root:root /var/www/3x-ui-pro-cover /var/www/3x-ui-pro-cover/index.html
         chmod 644 /var/www/3x-ui-pro-cover/index.html
         msg_ok "Local cover site installed."
     else
@@ -1425,7 +1428,7 @@ install_diagnostics() {
 
     # All application assets are shipped with this installer and verified
     # before the system is modified; installation needs no raw GitHub fetches.
-    mkdir -p "${diag_webroot}"
+    install -d -o root -g root -m 755 "${diag_webroot}"
     install -m 644 "${ASSET_DIR}/diagnostics/index.html" "${diag_webroot}/index.html"
     sed -i \
         -e "s|__DIAG_PATH__|${diag_path}|g" \
@@ -1441,18 +1444,21 @@ install_diagnostics() {
 
     # Test download files
     local testfiles="${diag_webroot}/testfiles"
-    mkdir -p "${testfiles}"
+    install -d -o root -g root -m 755 "${testfiles}"
     # Sparse files produce the same zero-filled network payload without
     # consuming ~1.1 GiB of physical disk space on a small VPS.
     truncate -s 15K  "${testfiles}/test-15k.bin"
     truncate -s 17K  "${testfiles}/test-17k.bin"
     truncate -s 100M "${testfiles}/test-100m.bin"
     truncate -s 1G   "${testfiles}/test-1g.bin"
+    chmod 644 "${testfiles}"/*.bin
     rm -f "${testfiles}/test-512m.bin"   # only used by the old single-stream speed test
-    chown -R www-data:www-data "${diag_webroot}" 2>/dev/null || true
+    chown -R root:root "${diag_webroot}"
+    find "${diag_webroot}" -type d -exec chmod 755 {} +
+    find "${diag_webroot}" -type f -exec chmod 644 {} +
 
     # MTR backend Python script
-    mkdir -p "$(dirname "${backend_script}")"
+    install -d -o root -g root -m 755 /usr/local/lib "$(dirname "${backend_script}")"
     install -m 755 "${ASSET_DIR}/diagnostics/mtr-backend.py" "${backend_script}"
 
     # Grant mtr raw socket capability (runs as restricted user, no root needed)
@@ -1461,8 +1467,9 @@ install_diagnostics() {
     command -v setcap &>/dev/null && setcap cap_net_raw+ep "$(command -v mtr-packet)" 2>/dev/null || true
 
     # Dedicated system user for mtr-backend
+    getent group mtr-backend >/dev/null 2>&1 || groupadd --system mtr-backend
     id mtr-backend &>/dev/null || \
-        useradd --system --no-create-home --shell /usr/sbin/nologin mtr-backend
+        useradd --system --gid mtr-backend --no-create-home --shell /usr/sbin/nologin mtr-backend
 
     # Systemd service for mtr-backend
     cat > /etc/systemd/system/mtr-backend.service <<EOF
@@ -1474,6 +1481,10 @@ After=network.target
 Type=simple
 User=mtr-backend
 Group=mtr-backend
+WorkingDirectory=/usr/local/lib/3x-ui-pro
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0027
+ExecStartPre=/usr/bin/test -r ${backend_script}
 ExecStart=/usr/bin/python3 ${backend_script} --port ${mtr_backend_port}
 Restart=on-failure
 RestartSec=5s
@@ -1508,18 +1519,22 @@ EOF
     systemctl daemon-reload
     systemctl enable mtr-backend
     systemctl restart mtr-backend
-    systemctl is-active --quiet mtr-backend || die "mtr-backend did not become active."
     local health_ok=0 attempt
     for attempt in {1..10}; do
         if curl -fsS --connect-timeout 2 --max-time 3 \
             --noproxy '*' \
-            "http://127.0.0.1:${mtr_backend_port}/health" >/dev/null; then
+            "http://127.0.0.1:${mtr_backend_port}/health" >/dev/null 2>&1; then
             health_ok=1
             break
         fi
         sleep 1
     done
-    ((health_ok == 1)) || die "mtr-backend health check failed."
+    if ((health_ok != 1)); then
+        msg_err "mtr-backend failed to listen on 127.0.0.1:${mtr_backend_port}."
+        systemctl status mtr-backend --no-pager -l >&2 || true
+        journalctl -u mtr-backend.service -n 30 --no-pager >&2 || true
+        die "mtr-backend health check failed; systemd diagnostics are shown above."
+    fi
 
     msg_ok "Network diagnostics installed at https://${domain}/${panel_path}/diag (panel login required)"
 }
